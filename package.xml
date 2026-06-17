@@ -1,42 +1,32 @@
 <?xml version="1.0"?>
-<package>
-  <name>aloam_velodyne</name>
+<package format="3">
+  <name>sc_pgo_ros2</name>
   <version>0.0.0</version>
-
   <description>
-    This is an advanced implentation of LOAM.
-    LOAM is described in the following paper:
-    J. Zhang and S. Singh. LOAM: Lidar Odometry and Mapping in Real-time.
-      Robotics: Science and Systems Conference (RSS). Berkeley, CA, July 2014.
+  sc_pgo_ros2
   </description>
 
-  <maintainer email="qintonguav@gmail.com">qintong</maintainer>
-
   <license>BSD</license>
+  <author email="name@email.com">name</author>
+  <maintainer email="name@email.com">name</maintainer>
 
-  <author email="zhangji@cmu.edu">Ji Zhang</author>
-  
-  <buildtool_depend>catkin</buildtool_depend>
-  <build_depend>geometry_msgs</build_depend>
-  <build_depend>nav_msgs</build_depend>
-  <build_depend>roscpp</build_depend>
-  <build_depend>rospy</build_depend>
-  <build_depend>std_msgs</build_depend>  
-  <build_depend>rosbag</build_depend>
-  <build_depend>sensor_msgs</build_depend>
-  <build_depend>tf</build_depend>
-  <build_depend>image_transport</build_depend>
-  
-  <run_depend>geometry_msgs</run_depend>
-  <run_depend>nav_msgs</run_depend>
-  <run_depend>sensor_msgs</run_depend>
-  <run_depend>roscpp</run_depend>
-  <run_depend>rospy</run_depend>
-  <run_depend>std_msgs</run_depend>
-  <run_depend>rosbag</run_depend>
-  <run_depend>tf</run_depend>
-  <run_depend>image_transport</run_depend>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>rclcpp</depend>
+  <depend>std_msgs</depend>
+  <depend>rosbag2</depend>
+  <depend>tf2</depend>
+  <depend>tf2_ros</depend>
+  <depend>image_transport</depend>
+  <depend>ament_index_cpp</depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
 
   <export>
+    <build_type>ament_cmake</build_type>
   </export>
 </package>
