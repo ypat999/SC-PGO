@@ -1060,27 +1060,27 @@ int main(int argc, char **argv) {
   rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr subGPS;
 
   subLaserCloudFullRes = nh->create_subscription<sensor_msgs::msg::PointCloud2>(
-      "/velodyne_cloud_registered_local", 100, laserCloudFullResHandler);
+      "velodyne_cloud_registered_local", rclcpp::SensorDataQoS(), laserCloudFullResHandler);
 
   subLaserOdometry = nh->create_subscription<nav_msgs::msg::Odometry>(
-      "/aft_mapped_to_init", 100, laserOdometryHandler);
+      "aft_mapped_to_init", 100, laserOdometryHandler);
 
   subGPS = nh->create_subscription<sensor_msgs::msg::NavSatFix>("/gps/fix", 100,
                                                                 gpsHandler);
 
   pubOdomAftPGO = nh->create_publisher<nav_msgs::msg::Odometry>(
-      "/aft_pgo_odom", rclcpp::QoS(100));
+      "aft_pgo_odom", rclcpp::QoS(100));
   pubOdomRepubVerifier = nh->create_publisher<nav_msgs::msg::Odometry>(
-      "/repub_odom", rclcpp::QoS(100));
+      "repub_odom", rclcpp::QoS(100));
   pubPathAftPGO = nh->create_publisher<nav_msgs::msg::Path>("/aft_pgo_path",
                                                             rclcpp::QoS(100));
   pubMapAftPGO = nh->create_publisher<sensor_msgs::msg::PointCloud2>(
-      "/aft_pgo_map", rclcpp::QoS(100));
+      "aft_pgo_map", rclcpp::QoS(100));
 
   pubLoopScanLocal = nh->create_publisher<sensor_msgs::msg::PointCloud2>(
-      "/loop_scan_local", rclcpp::QoS(100));
+      "loop_scan_local", rclcpp::QoS(100));
   pubLoopSubmapLocal = nh->create_publisher<sensor_msgs::msg::PointCloud2>(
-      "/loop_submap_local", rclcpp::QoS(100));
+      "loop_submap_local", rclcpp::QoS(100));
 
   std::thread posegraph_slam{process_pg};  // pose graph construction
   std::thread lc_detection{process_lcd};   // loop closure detection
