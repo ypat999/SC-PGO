@@ -60,6 +60,7 @@
 #include "aloam_velodyne/common.h"
 #include "aloam_velodyne/tic_toc.h"
 #include "btc/btc.h"
+#include "gicp_registration/gicp_registration.hpp"
 #include <ament_index_cpp/get_package_share_directory.hpp>
 
 using namespace gtsam;
@@ -145,6 +146,14 @@ std::string odomKITTIformat;
 std::fstream pgTimeSaveStream;
 
 std::shared_ptr<rclcpp::Node> nh;
+
+std::string frame_id_odom;
+std::string frame_id_aft_pgo;
+
+// GICP registration
+sc_pgo::GICPRegistration* gicp_registration;
+bool use_gicp_for_loop_closure = true;
+double gicp_fitness_score_threshold = 0.5;
 
 std::string padZeros(int val, int num_digits = 6) {
   std::ostringstream out;
@@ -321,15 +330,15 @@ void pubPath(void) {
   // Publish odom and path
   nav_msgs::msg::Odometry odomAftPGO;
   nav_msgs::msg::Path pathAftPGO;
-  pathAftPGO.header.frame_id = "odom";
+  pathAftPGO.header.frame_id = frame_id_odom;
   mKF.lock();
   for (int node_idx = 0; node_idx < recentIdxUpdated; node_idx++) {
     const Pose6D &pose_est =
         keyframePosesUpdated.at(node_idx);  // Updated poses
 
     nav_msgs::msg::Odometry odomAftPGOthis;
-    odomAftPGOthis.header.frame_id = "odom";
-    odomAftPGOthis.child_frame_id = "aft_pgo";
+    odomAftPGOthis.header.frame_id = frame_id_odom;
+    odomAftPGOthis.child_frame_id = frame_id_aft_pgo;
     odomAftPGOthis.header.stamp =
         rclcpp::Time(keyframeTimes.at(node_idx) * 1e9);
     odomAftPGOthis.pose.pose.position.x = pose_est.x;
@@ -349,7 +358,7 @@ void pubPath(void) {
     poseStampAftPGO.pose = odomAftPGOthis.pose.pose;
 
     pathAftPGO.header.stamp = odomAftPGOthis.header.stamp;
-    pathAftPGO.header.frame_id = "odom";
+    pathAftPGO.header.frame_id = frame_id_odom;
     pathAftPGO.poses.push_back(poseStampAftPGO);
   }
   mKF.unlock();
@@ -358,8 +367,8 @@ void pubPath(void) {
 
   geometry_msgs::msg::TransformStamped transformStamped;
   transformStamped.header.stamp = odomAftPGO.header.stamp;
-  transformStamped.header.frame_id = "odom";
-  transformStamped.child_frame_id = "aft_pgo";
+  transformStamped.header.frame_id = frame_id_odom;
+  transformStamped.child_frame_id = frame_id_aft_pgo;
   transformStamped.transform.translation.x = odomAftPGO.pose.pose.position.x;
   transformStamped.transform.translation.y = odomAftPGO.pose.pose.position.y;
   transformStamped.transform.translation.z = odomAftPGO.pose.pose.position.z;
@@ -483,12 +492,12 @@ std::optional<gtsam::Pose3> doICPVirtualRelative(int _loop_kf_idx,
   // loop verification
   sensor_msgs::msg::PointCloud2 cureKeyframeCloudMsg;
   pcl::toROSMsg(*cureKeyframeCloud, cureKeyframeCloudMsg);
-  cureKeyframeCloudMsg.header.frame_id = "odom";
+  cureKeyframeCloudMsg.header.frame_id = frame_id_odom;
   pubLoopScanLocal->publish(cureKeyframeCloudMsg);
 
   sensor_msgs::msg::PointCloud2 targetKeyframeCloudMsg;
   pcl::toROSMsg(*targetKeyframeCloud, targetKeyframeCloudMsg);
-  targetKeyframeCloudMsg.header.frame_id = "odom";
+  targetKeyframeCloudMsg.header.frame_id = frame_id_odom;
   pubLoopSubmapLocal->publish(targetKeyframeCloudMsg);
 
   // Stage 1: Coarse ICP matching with relaxed parameters
@@ -872,6 +881,30 @@ void performSCLoopClosure(void) {
     relative_pose_matrix.block<3, 1>(0, 3) = t;
     gtsam::Pose3 relative_pose(relative_pose_matrix.cast<double>());
 
+    // Use GICP for refinement if enabled
+    if (use_gicp_for_loop_closure) {
+      mKF.lock();
+      auto currCloud = keyframeLaserClouds[curr_node_idx];
+      auto prevCloud = keyframeLaserClouds[prev_node_idx];
+      mKF.unlock();
+
+      // GICP refinement using BTC result as initial guess
+      sc_pgo::GICPResult gicp_result = gicp_registration->align(
+        currCloud, prevCloud, relative_pose_matrix.cast<double>()
+      );
+
+      if (gicp_result.has_converged && 
+          gicp_result.fitness_score < gicp_fitness_score_threshold) {
+        // Use GICP refined pose
+        relative_pose = gtsam::Pose3(gicp_result.transformation.cast<double>());
+        cout << "[GICP] Refinement successful! Fitness score: " 
+             << gicp_result.fitness_score << endl;
+      } else {
+        cout << "[GICP] Refinement failed or score too high (" 
+             << gicp_result.fitness_score << "), using BTC result" << endl;
+      }
+    }
+
     if (validateLoopClosure(prev_node_idx, curr_node_idx, relative_pose)) {
       mtxPosegraph.lock();
       gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(
@@ -979,7 +1012,7 @@ void pubMap(void) {
 
   sensor_msgs::msg::PointCloud2 laserCloudMapPGOMsg;
   pcl::toROSMsg(*laserCloudMapPGO, laserCloudMapPGOMsg);
-  laserCloudMapPGOMsg.header.frame_id = "odom";
+  laserCloudMapPGOMsg.header.frame_id = frame_id_odom;
   pubMapAftPGO->publish(laserCloudMapPGOMsg);
 }
 
@@ -1001,6 +1034,35 @@ int main(int argc, char **argv) {
 
   nh->declare_parameter<std::string>("save_directory", "/");
   save_directory = nh->get_parameter("save_directory").as_string();
+
+  nh->declare_parameter<std::string>("frame_id_odom", "odom");
+  frame_id_odom = nh->get_parameter("frame_id_odom").as_string();
+
+  nh->declare_parameter<std::string>("frame_id_aft_pgo", "aft_pgo");
+  frame_id_aft_pgo = nh->get_parameter("frame_id_aft_pgo").as_string();
+
+  // GICP parameters
+  nh->declare_parameter<bool>("use_gicp_for_loop_closure", true);
+  use_gicp_for_loop_closure = nh->get_parameter("use_gicp_for_loop_closure").as_bool();
+
+  nh->declare_parameter<double>("gicp_fitness_score_threshold", 0.5);
+  gicp_fitness_score_threshold = nh->get_parameter("gicp_fitness_score_threshold").as_double();
+
+  // Initialize GICP registration
+  sc_pgo::GICPConfig gicp_config;
+  nh->declare_parameter<double>("gicp_transformation_epsilon", 1e-6);
+  gicp_config.transformation_epsilon = nh->get_parameter("gicp_transformation_epsilon").as_double();
+
+  nh->declare_parameter<double>("gicp_max_correspondence_distance", 30.0);
+  gicp_config.max_correspondence_distance = nh->get_parameter("gicp_max_correspondence_distance").as_double();
+
+  nh->declare_parameter<int>("gicp_max_iterations", 100);
+  gicp_config.max_iterations = nh->get_parameter("gicp_max_iterations").as_int();
+
+  nh->declare_parameter<int>("gicp_num_threads", 4);
+  gicp_config.num_threads = nh->get_parameter("gicp_num_threads").as_int();
+
+  gicp_registration = new sc_pgo::GICPRegistration(gicp_config);
 
   nh->declare_parameter<double>("keyframe_meter_gap", 2.0);
   keyframeMeterGap = nh->get_parameter("keyframe_meter_gap").as_double();

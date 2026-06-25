@@ -33,6 +33,13 @@ def generate_launch_description():
             {"sc_dist_thres": 0.3},
             {"sc_max_radius": 290.0},
             {"save_directory": "/home/ywj/save_data/"},
+            # GICP parameters for loop closure refinement
+            {"use_gicp_for_loop_closure": True},
+            {"gicp_fitness_score_threshold": 0.5},
+            {"gicp_transformation_epsilon": 1e-6},
+            {"gicp_max_correspondence_distance": 30.0},
+            {"gicp_max_iterations": 100},
+            {"gicp_num_threads": 4},
         ],
         remappings=[
             # ("/aft_mapped_to_init", "/Odometry"),

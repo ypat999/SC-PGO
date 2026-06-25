@@ -23,6 +23,8 @@ find_package(GTSAM REQUIRED QUIET)
 find_package(pcl_conversions REQUIRED)
 find_package(pcl_msgs REQUIRED)   # usually needed alongside
 
+# ndt_omp_ros2 dependency for GICP_OMP
+find_package(ndt_omp_ros2 REQUIRED)
 
 include_directories(
   include
@@ -35,6 +37,7 @@ include_directories(
 add_executable(alaserPGO 
   src/laserPosegraphOptimization.cpp
   src/btc.cpp
+  src/gicp_registration.cpp
 )
 ament_target_dependencies(alaserPGO 
   rclcpp sensor_msgs geometry_msgs nav_msgs std_msgs tf2 tf2_ros cv_bridge pcl_conversions pcl_msgs ament_index_cpp
@@ -46,6 +49,7 @@ target_link_libraries(alaserPGO
   ${PCL_LIBRARIES} ${CERES_LIBRARIES}
   ${OpenMP_CXX_FLAGS}
   gtsam
+  ndt_omp
 )
 
 install(TARGETS
