@@ -643,8 +643,8 @@ class BtcDescManager:
 
         if self.print_debug_info:
             print(f"[MergePlane] Found {len(clusters)} clusters")
-            for root, indices in clusters.items():
-                print(f"[MergePlane] Cluster {root}: {len(indices)} planes")
+            # for root, indices in clusters.items():
+            #     print(f"[MergePlane] Cluster {root}: {len(indices)} planes")
 
         # 对每个聚类重新计算合并后的Plane
         merge_plane_list = []
@@ -653,8 +653,8 @@ class BtcDescManager:
                 # 单独的平面，不合并
                 merge_plane_list.append(origin_list[indices[0]])
                 origin_list[indices[0]].id = 0
-                if self.print_debug_info:
-                    print(f"[MergePlane] Single plane {indices[0]} - no merge")
+                # if self.print_debug_info:
+                #     print(f"[MergePlane] Single plane {indices[0]} - no merge")
             else:
                 # 多个平面需要合并
                 merge_plane = Plane()

@@ -56,6 +56,7 @@ except ImportError:
 from loop_closure_common import (
     OfflineLoopCloser,
     GICPConfig,
+    load_unified_config,
     gicp_align,
     validate_loop_closure,
     init_noises,
@@ -85,39 +86,39 @@ def parse_args():
     parser.add_argument("--use-python-btc", action="store_true",
                         help="强制使用Python BTC实现（仅用于逻辑验证，性能慢100倍）")
     parser.add_argument("--btc-config", type=str, default=None,
-                        help="BTC 配置文件路径 (默认: 使用内置通用适配参数)")
+                        help="统一配置文件路径，包含BTC+GICP+关键帧+验证参数 (默认: 使用内置默认值)")
 
     # 关键帧参数 (对应 launch 文件中的 keyframe_meter_gap)
     parser.add_argument("--keyframe-gap", type=float, default=1.0,
-                        help="关键帧间距阈值 (m), 对应 keyframe_meter_gap (默认: 5.0)")
+                        help="关键帧间距阈值 (m), 默认 1.0 (可由配置文件覆盖)")
     parser.add_argument("--keyframe-deg-gap", type=float, default=10.0,
                         help="关键帧旋转阈值 (deg), 对应 keyframe_deg_gap (默认: 10.0)")
 
-    # GICP 参数 (对应 launch 文件中的 gicp_* 参数)
+    # GICP 参数 (可由 --btc-config yaml 覆盖)
     parser.add_argument("--no-gicp", action="store_true",
-                        help="禁用 GICP 精化")
-    parser.add_argument("--gicp-fitness-thres", type=float, default=0.5,
-                        help="GICP fitness score 阈值 (默认: 0.5)")
-    parser.add_argument("--gicp-max-dist", type=float, default=30.0,
-                        help="GICP 最大对应距离 (默认: 30.0)")
-    parser.add_argument("--gicp-max-iter", type=int, default=100,
-                        help="GICP 最大迭代次数 (默认: 100)")
-    parser.add_argument("--gicp-epsilon", type=float, default=1e-6,
-                        help="GICP 收敛阈值 (默认: 1e-6)")
+                        help="禁用 GICP 精化（覆盖配置文件中的 gicp.enabled）")
+    parser.add_argument("--gicp-fitness-thres", type=float, default=0.3,
+                        help="GICP fitness score 阈值 (可由配置文件覆盖, 默认: 0.3)")
+    parser.add_argument("--gicp-max-dist", type=float, default=3.0,
+                        help="GICP 最大对应距离 (默认: 3.0)")
+    parser.add_argument("--gicp-max-iter", type=int, default=32,
+                        help="GICP 最大迭代次数 (默认: 32)")
+    parser.add_argument("--gicp-epsilon", type=float, default=0.001,
+                        help="GICP 协方差正则化/收敛精度 (默认: 0.001)")
 
-    # 点云下采样
+    # 点云下采样（可由配置文件中的 gicp.scan_ds_size 覆盖）
     parser.add_argument("--scan-ds-size", type=float, default=0.1,
-                        help="关键帧点云下采样体素大小 (m), 对应 downSizeFilterScancontext (默认: 0.4)")
+                        help="关键帧点云下采样体素大小 (m, 可由配置文件覆盖, 默认: 0.1)")
 
     # 调试参数
     parser.add_argument("--debug-btc", action="store_true",
                         help="开启C++ BTC详细调试日志（平面检测、合并率、描述子数等）")
 
-    # 回环验证参数 (对应 C++ validateLoopClosure)
+    # 回环验证参数 (可由配置文件的 loop_validation 部分覆盖)
     parser.add_argument("--max-loop-distance", type=float, default=100.0,
                         help="最大回环距离 (m) (默认: 100.0)")
     parser.add_argument("--max-yaw-diff", type=float, default=None,
-                        help="最大偏航角差 (rad), 默认 0.75π")
+                        help="最大偏航角差 (rad), 默认从配置文件读取或 0.75π")
 
     return parser.parse_args()
 
@@ -136,24 +137,53 @@ def main():
         print("[ERROR]   2. 或使用Python版本: --use-python-btc")
         return 1
 
-    # 构建 GICP 配置 (与 launch 文件参数一致)
-    gicp_config = GICPConfig()
-    gicp_config.fitness_score_threshold = args.gicp_fitness_thres
-    gicp_config.max_correspondence_distance = args.gicp_max_dist
-    gicp_config.max_iterations = args.gicp_max_iter
-    gicp_config.transformation_epsilon = args.gicp_epsilon
+    # 从统一配置文件加载参数（CLI 可覆盖）
+    if args.btc_config and os.path.exists(args.btc_config):
+        cfg = load_unified_config(args.btc_config)
+        btc_config_file = cfg['btc_config_path']
+        gicp_config = cfg['gicp_config']
+        use_gicp = cfg['use_gicp']
+        keyframe_meter_gap = cfg['keyframe_meter_gap']
+        keyframe_deg_gap = cfg['keyframe_deg_gap']
+        scan_ds_size = cfg['gicp_config'].scan_ds_size
+        max_loop_distance = cfg['max_loop_distance']
+        max_yaw_diff = cfg['max_yaw_diff']
+    else:
+        btc_config_file = args.btc_config
+        gicp_config = GICPConfig()
+        use_gicp = not args.no_gicp
+        keyframe_meter_gap = args.keyframe_gap
+        keyframe_deg_gap = args.keyframe_deg_gap
+        scan_ds_size = args.scan_ds_size
+        max_loop_distance = args.max_loop_distance
+        max_yaw_diff = args.max_yaw_diff
 
-    # 创建离线回环检测器 (默认使用C++ BTC)
+    # CLI 覆盖 GICP 参数（手动调参用）
+    if args.gicp_fitness_thres != 0.3 or args.gicp_max_dist != 3.0 or \
+       args.gicp_max_iter != 32 or args.gicp_epsilon != 0.001:
+        gicp_config.fitness_score_threshold = args.gicp_fitness_thres
+        gicp_config.max_correspondence_distance = args.gicp_max_dist
+        gicp_config.max_iterations = args.gicp_max_iter
+        gicp_config.transformation_epsilon = args.gicp_epsilon
+        gicp_config.gicp_epsilon = args.gicp_epsilon
+    if args.no_gicp:
+        use_gicp = False
+    if args.max_yaw_diff is not None:
+        max_yaw_diff = args.max_yaw_diff
+
+    # 创建离线回环检测器
     closer = OfflineLoopCloser(
         data_dir=args.data_dir,
-        btc_config_file=args.btc_config,
+        btc_config_file=btc_config_file,
         gicp_config=gicp_config,
-        keyframe_meter_gap=args.keyframe_gap,
-        keyframe_deg_gap=args.keyframe_deg_gap,
-        use_gicp=not args.no_gicp,
-        scan_ds_size=args.scan_ds_size,
-        use_cpp_btc=use_cpp_btc,  # 默认True
+        keyframe_meter_gap=keyframe_meter_gap,
+        keyframe_deg_gap=keyframe_deg_gap,
+        use_gicp=use_gicp,
+        scan_ds_size=scan_ds_size,
+        use_cpp_btc=use_cpp_btc,
         debug_btc=args.debug_btc,
+        max_loop_distance=max_loop_distance,
+        max_yaw_diff=max_yaw_diff,
     )
 
     # 打印BTC配置参数

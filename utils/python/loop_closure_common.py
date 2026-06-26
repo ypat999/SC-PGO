@@ -13,6 +13,7 @@
 import os
 import numpy as np
 from numpy import linalg as LA
+import yaml
 
 try:
     import open3d as o3d
@@ -242,24 +243,55 @@ def _extract_yaw(T):
     return np.arctan2(R[1, 0], R[0, 0])
 
 
+def _interp_rotation_matrix(R1, R2, t):
+    """球面线性插值（Slerp）两个旋转矩阵"""
+    # R1 到 R2 的相对旋转
+    R_rel = R1.T @ R2
+    # 提取旋转轴和角度
+    angle = np.arccos(np.clip((np.trace(R_rel) - 1) / 2, -1, 1))
+    if abs(angle) < 1e-6:
+        return R1.copy()
+    axis = np.array([R_rel[2, 1] - R_rel[1, 2],
+                     R_rel[0, 2] - R_rel[2, 0],
+                     R_rel[1, 0] - R_rel[0, 1]])
+    axis = axis / np.linalg.norm(axis)
+    # Rodrigues 公式插值
+    theta = angle * t
+    c, s = np.cos(theta), np.sin(theta)
+    x, y, z = axis
+    R_interp = np.array([
+        [c + x*x*(1-c), x*y*(1-c) - z*s, x*z*(1-c) + y*s],
+        [y*x*(1-c) + z*s, c + y*y*(1-c), y*z*(1-c) - x*s],
+        [z*x*(1-c) - y*s, z*y*(1-c) + x*s, c + z*z*(1-c)]
+    ])
+    return R1 @ R_interp
+
+
 # ======================== 位姿图优化 (对应 C++ GTSAM ISAM2) ========================
 
 def init_noises():
     """
     对应 C++ initNoises
     返回 (prior_noise, odom_noise, robust_loop_noise, robust_gps_noise)
+
+    噪声模型说明（odom 可信场景）:
+      - prior_noise: 先验噪声极小，固定首个位姿
+      - odom_noise: 里程计噪声极小（sigma平移1cm, 旋转0.5°），坚信odom
+      - loop_noise: 回环噪声较大（sigma平移1m, 旋转0.5rad），不信任回环
+        配合 Huber 鲁棒核，仅当回环与 odom 高度一致时才起作用
     """
     prior_noise = gtsam.noiseModel.Diagonal.Variances(
         np.array([1e-12, 1e-12, 1e-12, 1e-12, 1e-12, 1e-12])
     )
+    # 坚信 odom: sigma平移=0.01m, sigma旋转=0.008rad (≈0.5°)
     odom_noise = gtsam.noiseModel.Diagonal.Variances(
-        np.array([1e-6, 1e-6, 1e-6, 1e-4, 1e-4, 1e-4])
+        np.array([1e-4, 1e-4, 1e-4, 6.4e-5, 6.4e-5, 6.4e-5])
     )
-    loop_noise_score = 0.5
-    robust_noise_vector = np.array([loop_noise_score] * 6)
+    # 不信任回环: sigma平移=1m, sigma旋转=0.5rad
+    loop_noise_vector = np.array([1.0, 1.0, 1.0, 0.25, 0.25, 0.25])
     robust_loop_noise = gtsam.noiseModel.Robust.Create(
         gtsam.noiseModel.mEstimator.Huber.Create(1.345),
-        gtsam.noiseModel.Diagonal.Variances(robust_noise_vector)
+        gtsam.noiseModel.Diagonal.Variances(loop_noise_vector)
     )
     # GPS noise
     big_noise_tolerant_to_xy = 1e9
@@ -359,6 +391,53 @@ def _extract_rpy(T):
     return roll, pitch, yaw
 
 
+def load_unified_config(config_file):
+    """
+    加载统一配置文件（btc + gicp + keyframe + loop_validation 合并为一个 yaml），
+    返回 dict:
+      - btc_config_path: str (C++ BTC 模块直接读原始路径)
+      - gicp_config: GICPConfig
+      - keyframe_meter_gap: float
+      - keyframe_deg_gap: float
+      - use_gicp: bool
+      - scan_ds_size: float
+      - max_loop_distance: float
+      - max_yaw_diff: float
+    """
+    with open(config_file, 'r') as f:
+        lines = f.readlines()
+    # 跳过 OpenCV FileStorage 头 (%YAML:1.0)
+    cleaned = ''.join(l for l in lines if not l.strip().startswith('%'))
+    data = yaml.safe_load(cleaned)
+
+    result = {}
+    result['btc_config_path'] = config_file
+
+    # GICP 部分
+    gicp_cfg = GICPConfig()
+    g = data.get('gicp', {})
+    gicp_cfg.fitness_score_threshold = g.get('fitness_score_threshold', 0.3)
+    gicp_cfg.max_correspondence_distance = g.get('max_correspondence_distance', 3.0)
+    gicp_cfg.max_iterations = g.get('max_iterations', 32)
+    gicp_cfg.transformation_epsilon = g.get('transformation_epsilon', 0.001)
+    gicp_cfg.gicp_epsilon = g.get('gicp_epsilon', 0.001)
+    gicp_cfg.scan_ds_size = g.get('scan_ds_size', 0.1)
+    result['gicp_config'] = gicp_cfg
+    result['use_gicp'] = g.get('enabled', True)
+
+    # 关键帧部分
+    kf = data.get('keyframe', {})
+    result['keyframe_meter_gap'] = kf.get('meter_gap', 1.0)
+    result['keyframe_deg_gap'] = kf.get('deg_gap', 10.0)
+
+    # 回环验证部分
+    lv = data.get('loop_validation', {})
+    result['max_loop_distance'] = lv.get('max_distance', 100.0)
+    result['max_yaw_diff'] = lv.get('max_yaw_diff', np.pi * 0.75)
+
+    return result
+
+
 # ======================== 完整离线回环流程 (对应 C++ performSCLoopClosure + process_pg) ========================
 
 class OfflineLoopCloser:
@@ -376,7 +455,7 @@ class OfflineLoopCloser:
     def __init__(self, data_dir=None, btc_config_file=None, gicp_config=None,
                  keyframe_meter_gap=5.0, keyframe_deg_gap=10.0,
                  use_gicp=True, scan_ds_size=0.4, use_cpp_btc=True,
-                 debug_btc=False):
+                 debug_btc=False, max_loop_distance=100.0, max_yaw_diff=None):
         """
         离线回环检测器
 
@@ -428,6 +507,13 @@ class OfflineLoopCloser:
                 print("[BTC] 使用Python实现 (内置默认配置)")
                 
             self.btc_config = None
+
+        # 回环验证参数
+        self.max_loop_distance = max_loop_distance
+        if max_yaw_diff is not None:
+            self.max_yaw_diff = max_yaw_diff
+        else:
+            self.max_yaw_diff = np.pi * 0.75  # 默认 0.75π
 
         # 启用调试日志
         if self.debug_btc and not self.use_cpp_btc:
@@ -623,6 +709,7 @@ class OfflineLoopCloser:
 
                 # GICP 精化 (对应 C++ performSCLoopClosure 中的 GICP 逻辑)
                 gicp_success = False
+                gicp_fitness = 0.0
                 if self.use_gicp and HAS_O3D:
                     gicp_result = gicp_align(
                         self.keyframe_clouds_ds[curr_idx],
@@ -646,22 +733,54 @@ class OfflineLoopCloser:
                         if not is_degenerate:
                             relative_pose_matrix = gicp_result.transformation
                             gicp_success = True
+                            gicp_fitness = gicp_result.fitness_score
                             print(f"  [GICP] 精化成功! Fitness: {gicp_result.fitness_score:.4f}")
                         else:
                             print(f"  [GICP] 检测到退化方向，拒绝回环!")
+                            continue  # 直接跳过这个回环
 
                     else:
                         fitness = gicp_result.fitness_score if gicp_result else float('inf')
-                        print(f"  [GICP] 精化失败或分数过高 ({fitness:.4f})，使用 BTC 结果")
+                        print(f"  [GICP] 精化失败或分数过高 ({fitness:.4f})，拒绝回环!")
+                        continue  # 直接跳过，不再继续验证
 
                 # 回环验证 (对应 C++ validateLoopClosure)
                 if validate_loop_closure(
                         self.keyframe_poses[prev_idx],
                         self.keyframe_poses[curr_idx],
-                        relative_pose_matrix):
+                        relative_pose_matrix,
+                        max_loop_distance=self.max_loop_distance,
+                        max_yaw_diff=self.max_yaw_diff):
+                    # 找到对应的原始 scan 索引
+                    orig_prev = self.keyframe_indices[prev_idx]
+                    orig_curr = self.keyframe_indices[curr_idx]
+                    scan_prev_name = f"{orig_prev:06d}.pcd"
+                    scan_curr_name = f"{orig_curr:06d}.pcd"
+                    # 计算相对位姿 (从 prev 到 curr)
+                    T_delta = np.linalg.inv(self.keyframe_poses[prev_idx]) @ self.keyframe_poses[curr_idx]
+                    t_vec = T_delta[:3, 3]
+                    roll, pitch, yaw = _extract_rpy(T_delta)
+                    print(f"\n  ===== 回环验证通过 =====")
+                    print(f"  KeyFrame: {prev_idx} (Scan {orig_prev:06d}) <-> KeyFrame {curr_idx} (Scan {orig_curr:06d})")
+                    print(f"  BTC score: {loop_score:.4f}, GICP fitness: {gicp_fitness:.4f}")
+                    print(f"  PCD文件: Scans/{scan_prev_name} <-> Scans/{scan_curr_name}")
+                    print(f"  相对平移: [{t_vec[0]:.3f}, {t_vec[1]:.3f}, {t_vec[2]:.3f}] m")
+                    print(f"  相对旋转 (RPY): [{roll:.3f}, {pitch:.3f}, {yaw:.3f}] rad")
+                    if gicp_success:
+                        print(f"  (使用GICP精化后的位姿)")
+                    else:
+                        print(f"  (使用BTC原始位姿)")
+                    print(f"  =========================\n")
+
                     relative_pose_gtsam = matrix_to_gtsam_pose3(relative_pose_matrix)
                     loop_constraints.append((prev_idx, curr_idx, relative_pose_matrix, loop_score))
-                    self.loop_pairs.append((prev_idx, curr_idx, loop_score, 0.0))
+                    self.loop_pairs.append((
+                        prev_idx, curr_idx,
+                        scan_prev_name, scan_curr_name,
+                        loop_score, gicp_fitness,
+                        t_vec[0], t_vec[1], t_vec[2],
+                        roll, pitch, yaw
+                    ))
                     print(f"  [BTC Loop] 回环约束已添加: {prev_idx} <-> {curr_idx}")
 
         print(f"\n  ----- Step 3 汇总 -----")
@@ -687,6 +806,7 @@ class OfflineLoopCloser:
         self.keyframe_clouds_ds = []
         self.keyframe_poses = []
         self.keyframe_poses6d = []
+        self.keyframe_indices = []  # 记录每个关键帧对应原始帧的索引
 
         translation_accumulated = float('inf')
         rotation_accumulated = float('inf')
@@ -731,6 +851,7 @@ class OfflineLoopCloser:
                 self.keyframe_clouds_ds.append(cloud_ds)  # GICP 用下采样点云
                 self.keyframe_poses.append(T.copy())
                 self.keyframe_poses6d.append(pose6d)
+                self.keyframe_indices.append(i)  # 记录原始帧索引
 
             prev_pose6d = pose6d
 
@@ -752,7 +873,7 @@ class OfflineLoopCloser:
 
         # ISAM2 参数 (对应 C++ ISAM2Params)
         isam_params = gtsam.ISAM2Params()
-        isam_params.relinearizeThreshold = 0.01
+        isam_params.setRelinearizeThreshold(0.01)
         isam_params.relinearizeSkip = 1
         isam = gtsam.ISAM2(isam_params)
 
@@ -779,17 +900,18 @@ class OfflineLoopCloser:
             graph.add(gtsam.BetweenFactorPose3(prev_idx, curr_idx, rel_gtsam, robust_loop_noise))
             print(f"  添加回环因子: {prev_idx} <-> {curr_idx}")
 
-        # 运行 ISAM2 优化
-        isam.update(graph, initial)
-        isam.update()
-
-        current_estimate = isam.calculateEstimate()
+        # 离线优化使用 Levenberg-Marquardt 批量优化器
+        # ISAM2 是增量式优化器，适合在线 SLAM；LM 适合小规模离线批量优化
+        params = gtsam.LevenbergMarquardtParams()
+        params.setVerbosityLM("SUMMARY")
+        optimizer = gtsam.LevenbergMarquardtOptimizer(graph, initial, params)
+        result = optimizer.optimize()
 
         # 提取优化后的位姿
         optimized_poses = []
         for i in range(len(self.keyframe_poses)):
-            if current_estimate.exists(i):
-                pose3 = current_estimate.atPose3(i)
+            if result.exists(i):
+                pose3 = result.atPose3(i)
                 optimized_poses.append(gtsam_pose3_to_matrix(pose3))
             else:
                 optimized_poses.append(self.keyframe_poses[i].copy())
@@ -798,20 +920,78 @@ class OfflineLoopCloser:
         return optimized_poses
 
     def _save_results(self, optimized_poses):
-        """保存结果"""
+        """保存结果 — 将关键帧优化结果传播到所有原始帧"""
         data_dir = self.data_dir
 
-        # 优化后的轨迹
+        # 将关键帧的优化校正传播到所有原始帧
+        full_optimized = []
+        for i, T_orig in enumerate(self.all_poses):
+            # 找到当前帧前后的关键帧索引
+            kf_idx_before = None
+            kf_idx_after = None
+            for ki, oi in enumerate(self.keyframe_indices):
+                if oi <= i:
+                    kf_idx_before = ki
+                if oi >= i and kf_idx_after is None:
+                    kf_idx_after = ki
+
+            if kf_idx_before is None:
+                kf_idx_before = 0
+            if kf_idx_after is None:
+                kf_idx_after = len(self.keyframe_indices) - 1
+
+            if kf_idx_before == kf_idx_after:
+                # 当前帧前后是同一个关键帧，直接用该关键帧的位姿
+                T_opt = optimized_poses[kf_idx_before]
+            else:
+                # 线性插值权重（按原始帧索引距离）
+                o_before = self.keyframe_indices[kf_idx_before]
+                o_after = self.keyframe_indices[kf_idx_after]
+                weight = (i - o_before) / max(o_after - o_before, 1)
+
+                # 计算两个关键帧各自的校正量
+                T_orig_before = self.keyframe_poses[kf_idx_before]
+                T_orig_after = self.keyframe_poses[kf_idx_after]
+                T_corr_before = np.linalg.inv(T_orig_before) @ optimized_poses[kf_idx_before]
+                T_corr_after = np.linalg.inv(T_orig_after) @ optimized_poses[kf_idx_after]
+
+                # 对平移做线性插值，旋转做球面线性插值（slerp）
+                t_before = T_corr_before[:3, 3]
+                t_after = T_corr_after[:3, 3]
+                t_interp = t_before + weight * (t_after - t_before)
+
+                R_before = T_corr_before[:3, :3]
+                R_after = T_corr_after[:3, :3]
+                R_interp = _interp_rotation_matrix(R_before, R_after, weight)
+
+                T_corr = np.eye(4)
+                T_corr[:3, :3] = R_interp
+                T_corr[:3, 3] = t_interp
+
+                T_opt = T_orig @ T_corr
+
+            full_optimized.append(T_opt)
+
+        # 保存全部帧的优化轨迹
         opt_file = os.path.join(data_dir, "optimized_poses.txt")
-        self._save_poses_kitti(opt_file, optimized_poses)
-        print(f"  优化轨迹已保存: {opt_file}")
+        self._save_poses_kitti(opt_file, full_optimized)
+        print(f"  优化轨迹已保存: {opt_file} ({len(full_optimized)} 帧)")
 
         # 回环对
         pairs_file = os.path.join(data_dir, "loop_pairs.txt")
         with open(pairs_file, 'w') as f:
-            f.write("# frame_a frame_b btc_score fitness_score\n")
-            for a, b, s, fs in self.loop_pairs:
-                f.write(f"{a} {b} {s:.6f} {fs:.6f}\n")
+            f.write("# frame_a frame_b scan_file_a scan_file_b btc_score fitness_score tx ty tz roll pitch yaw\n")
+            for pair in self.loop_pairs:
+                if len(pair) >= 12:
+                    prev_kf, curr_kf, scan_a, scan_b, score, fitness, tx, ty, tz, roll, pitch, yaw = pair
+                    f.write(f"{prev_kf} {curr_kf} {scan_a} {scan_b} "
+                            f"{score:.6f} {fitness:.6f} "
+                            f"{tx:.4f} {ty:.4f} {tz:.4f} "
+                            f"{roll:.4f} {pitch:.4f} {yaw:.4f}\n")
+                else:
+                    # 兼容旧格式
+                    a, b, s, fs = pair
+                    f.write(f"{a} {b} -1 -1 {s:.6f} {fs:.6f} 0 0 0 0 0 0\n")
         print(f"  回环对已保存: {pairs_file}")
 
     # ======================== I/O 工具 ========================
