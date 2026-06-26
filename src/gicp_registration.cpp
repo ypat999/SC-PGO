@@ -1,4 +1,5 @@
 #include "gicp_registration/gicp_registration.hpp"
+#include <pclomp/gicp_omp_impl.hpp>
 #include <iostream>
 
 namespace sc_pgo {
@@ -29,10 +30,6 @@ void GICPRegistration::initializeGICP() {
   gicp_->setMaximumOptimizerIterations(config_.max_optimizer_iterations);
   gicp_->setGICPEpsilon(config_.gicp_epsilon);
   gicp_->setMaximumIterations(config_.max_iterations);
-  
-  if (config_.num_threads > 0) {
-    gicp_->setNumThreads(config_.num_threads);
-  }
 }
 
 GICPResult GICPRegistration::align(
@@ -64,11 +61,10 @@ GICPResult GICPRegistration::align(
   result.transformation = gicp_->getFinalTransformation().cast<double>();
   result.has_converged = gicp_->hasConverged();
   result.fitness_score = gicp_->getFitnessScore();
-  result.num_iterations = gicp_->getFinalNumIterations();
+  result.num_iterations = 0;  // not available in this GICP version
   
   std::cout << "[GICP] Converged: " << result.has_converged 
-            << ", Fitness score: " << result.fitness_score 
-            << ", Iterations: " << result.num_iterations << std::endl;
+            << ", Fitness score: " << result.fitness_score << std::endl;
   
   return result;
 }

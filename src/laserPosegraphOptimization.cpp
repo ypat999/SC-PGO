@@ -1077,8 +1077,6 @@ int main(int argc, char **argv) {
   pgTimeSaveStream.precision(std::numeric_limits<double>::max_digits10);
   pgScansDirectory = save_directory + "Scans/";
   cout << "pgScansDirectory " << pgScansDirectory << endl;
-  auto unused = system((std::string("exec rm -r ") + pgScansDirectory).c_str());
-  unused = system((std::string("mkdir -p ") + pgScansDirectory).c_str());
 
   keyframeRadGap = deg2rad(keyframeDegGap);
 

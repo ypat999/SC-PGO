@@ -40,7 +40,7 @@ add_executable(alaserPGO
   src/gicp_registration.cpp
 )
 ament_target_dependencies(alaserPGO 
-  rclcpp sensor_msgs geometry_msgs nav_msgs std_msgs tf2 tf2_ros cv_bridge pcl_conversions pcl_msgs ament_index_cpp
+  rclcpp sensor_msgs geometry_msgs nav_msgs std_msgs tf2 tf2_ros cv_bridge pcl_conversions pcl_msgs ament_index_cpp ndt_omp_ros2
 )
 target_compile_options(alaserPGO 
   PRIVATE ${OpenMP_CXX_FLAGS}
@@ -49,7 +49,6 @@ target_link_libraries(alaserPGO
   ${PCL_LIBRARIES} ${CERES_LIBRARIES}
   ${OpenMP_CXX_FLAGS}
   gtsam
-  ndt_omp
 )
 
 install(TARGETS
