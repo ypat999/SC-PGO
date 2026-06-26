@@ -95,13 +95,25 @@ void down_sampling_voxel(pcl::PointCloud<pcl::PointXYZI> &pl_feat,
 
 double binary_similarity(const BinaryDescriptor &b1,
                          const BinaryDescriptor &b2) {
-  double dis = 0;
+  // P1-2: 改用Jaccard相似度，增加惩罚项，避免descriptor太容易撞分
+  double match = 0;      // 1-1 匹配（加分）
+  double mismatch = 0;   // 1-0 或 0-1 不匹配（惩罚）
+
   for (size_t i = 0; i < b1.occupy_array_.size(); i++) {
     if (b1.occupy_array_[i] == true && b2.occupy_array_[i] == true) {
-      dis += 1;
+      match++;
+    } else if (b1.occupy_array_[i] == true || b2.occupy_array_[i] == true) {
+      mismatch++;  // 惩罚项：一方occupied另一方不occupied
     }
+    // 0-0一致不计入，因为这是"共同空白"，不如"共同occupied"有价值
   }
-  return 2 * dis / (b1.summary_ + b2.summary_);
+
+  // Jaccard相似度：match / (match + mismatch)
+  // 当match=0时返回0，避免除零
+  if (match + mismatch == 0) {
+    return 0.0;
+  }
+  return match / (match + mismatch);
 }
 
 bool binary_greater_sort(BinaryDescriptor a, BinaryDescriptor b) {
@@ -214,6 +226,9 @@ void BtcDescManager::GenerateBtcDescs(
   std::vector<std::shared_ptr<Plane>> proj_plane_list;
   std::vector<std::shared_ptr<Plane>> merge_plane_list;
   get_project_plane(voxel_map, proj_plane_list);
+
+  // P2-4: 增加调试统计信息 - 原始平面数量
+  int original_plane_num = proj_plane_list.size();
   if (proj_plane_list.size() == 0) {
     std::shared_ptr<Plane> single_plane(new Plane);
     single_plane->normal_ << 0, 0, 1;
@@ -225,6 +240,18 @@ void BtcDescManager::GenerateBtcDescs(
     merge_plane(proj_plane_list, merge_plane_list);
     sort(merge_plane_list.begin(), merge_plane_list.end(), plane_greater_sort);
   }
+
+  // P2-4: 增加调试统计信息 - 合并后平面数量和合并率
+  int merged_plane_num = merge_plane_list.size();
+  if (print_debug_info_) {
+    float merge_ratio = (original_plane_num > 0) ?
+        (1.0f - (float)merged_plane_num / (float)original_plane_num) : 0.0f;
+    std::cout << "[Description] original planes:" << original_plane_num
+              << ", merged planes:" << merged_plane_num
+              << ", merge ratio:" << merge_ratio * 100 << "%"
+              << std::endl;
+  }
+
   std::vector<BinaryDescriptor> binary_list;
   binary_extractor(merge_plane_list, input_cloud, binary_list);
   history_binary_list_.push_back(binary_list);
@@ -305,9 +332,12 @@ void BtcDescManager::SearchLoop(
 void BtcDescManager::AddBtcDescs(const std::vector<BTC> &btcs_vec) {
   for (auto single_std : btcs_vec) {
     BTC_LOC position;
-    position.x = (int)(single_std.triangle_[0] + 0.5);
-    position.y = (int)(single_std.triangle_[1] + 0.5);
-    position.z = (int)(single_std.triangle_[2] + 0.5);
+    // P1-1: 改用可配置量化，避免bucket太粗导致查询稳定性差
+    // 使用std_side_resolution_作为hash分辨率（默认0.2m）
+    double hash_resolution = config_setting_.std_side_resolution_;
+    position.x = (int)(single_std.triangle_[0] / hash_resolution);
+    position.y = (int)(single_std.triangle_[1] / hash_resolution);
+    position.z = (int)(single_std.triangle_[2] / hash_resolution);
     auto iter = data_base_.find(position);
     if (iter != data_base_.end()) {
       data_base_[position].push_back(single_std);
@@ -391,6 +421,17 @@ void BtcDescManager::PlaneGeomrtricIcp(
       }
     }
   }
+
+  // P2-2: 增加ICP退化判断，有效匹配数太少则直接返回
+  if (useful_match < config_setting_.icp_min_match_num_) {
+    if (print_debug_info_) {
+      std::cout << "[ICP] Useful match num: " << useful_match
+                << " < min threshold: " << config_setting_.icp_min_match_num_
+                << ", skip optimization to avoid degenerate case." << std::endl;
+    }
+    return;
+  }
+
   ceres::Solver::Options options;
   options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
   options.max_num_iterations = 100;
@@ -540,7 +581,8 @@ void BtcDescManager::get_project_plane(
         Eigen::Vector3cd evals = es.eigenvalues();
         Eigen::Vector3d evalsReal;
         evalsReal = evals.real();
-        Eigen::Matrix3f::Index evalsMin, evalsMax;
+        // 修复类型混用：Matrix3d应该用Matrix3d::Index或Eigen::Index
+        Eigen::Matrix3d::Index evalsMin, evalsMax;
         evalsReal.rowwise().sum().minCoeff(&evalsMin);
         evalsReal.rowwise().sum().maxCoeff(&evalsMax);
         Eigen::Vector3d evecMin = evecs.real().col(evalsMin);
@@ -573,101 +615,139 @@ void BtcDescManager::merge_plane(
     merge_plane_list = origin_list;
     return;
   }
-  for (size_t i = 0; i < origin_list.size(); i++) origin_list[i]->id_ = 0;
-  int current_id = 1;
-  for (auto iter = origin_list.end() - 1; iter != origin_list.begin(); iter--) {
-    for (auto iter2 = origin_list.begin(); iter2 != iter; iter2++) {
-      Eigen::Vector3d normal_diff = (*iter)->normal_ - (*iter2)->normal_;
-      Eigen::Vector3d normal_add = (*iter)->normal_ + (*iter2)->normal_;
-      double dis1 =
-          fabs((*iter)->normal_(0) * (*iter2)->center_(0) +
-               (*iter)->normal_(1) * (*iter2)->center_(1) +
-               (*iter)->normal_(2) * (*iter2)->center_(2) + (*iter)->d_);
-      double dis2 =
-          fabs((*iter2)->normal_(0) * (*iter)->center_(0) +
-               (*iter2)->normal_(1) * (*iter)->center_(1) +
-               (*iter2)->normal_(2) * (*iter)->center_(2) + (*iter2)->d_);
-      if (normal_diff.norm() < config_setting_.plane_merge_normal_thre_ ||
-          normal_add.norm() < config_setting_.plane_merge_normal_thre_)
-        if (dis1 < config_setting_.plane_merge_dis_thre_ &&
+
+  // P0-3: 使用Union-Find进行真正的连通域合并
+  // P1-3: 使用KDTree降低复杂度，只比较radius内的平面
+  UnionFind uf(origin_list.size());
+
+  // 构建KDTree，使用平面中心点
+  pcl::PointCloud<pcl::PointXYZ>::Ptr plane_centers(
+      new pcl::PointCloud<pcl::PointXYZ>);
+  for (size_t i = 0; i < origin_list.size(); i++) {
+    pcl::PointXYZ center;
+    center.x = origin_list[i]->center_[0];
+    center.y = origin_list[i]->center_[1];
+    center.z = origin_list[i]->center_[2];
+    plane_centers->push_back(center);
+  }
+
+  pcl::KdTreeFLANN<pcl::PointXYZ>::Ptr kd_tree(
+      new pcl::KdTreeFLANN<pcl::PointXYZ>);
+  kd_tree->setInputCloud(plane_centers);
+
+  double search_radius = config_setting_.plane_merge_search_radius_;
+  std::vector<int> pointIdxRadiusSearch;
+  std::vector<float> pointRadiusSquaredDistance;
+
+  // 第一遍遍历：使用KDTree找到邻域平面，满足条件则Union
+  for (size_t i = 0; i < origin_list.size(); i++) {
+    pcl::PointXYZ searchPoint = plane_centers->points[i];
+    if (kd_tree->radiusSearch(searchPoint, search_radius, pointIdxRadiusSearch,
+                              pointRadiusSquaredDistance) > 0) {
+      for (size_t idx = 0; idx < pointIdxRadiusSearch.size(); idx++) {
+        size_t j = pointIdxRadiusSearch[idx];
+        if (j <= i) continue;  // 避免重复比较
+
+        Eigen::Vector3d normal_diff = origin_list[i]->normal_ - origin_list[j]->normal_;
+        Eigen::Vector3d normal_add = origin_list[i]->normal_ + origin_list[j]->normal_;
+        double dis1 =
+            fabs(origin_list[i]->normal_(0) * origin_list[j]->center_(0) +
+                 origin_list[i]->normal_(1) * origin_list[j]->center_(1) +
+                 origin_list[i]->normal_(2) * origin_list[j]->center_(2) +
+                 origin_list[i]->d_);
+        double dis2 =
+            fabs(origin_list[j]->normal_(0) * origin_list[i]->center_(0) +
+                 origin_list[j]->normal_(1) * origin_list[i]->center_(1) +
+                 origin_list[j]->normal_(2) * origin_list[i]->center_(2) +
+                 origin_list[j]->d_);
+
+        if ((normal_diff.norm() < config_setting_.plane_merge_normal_thre_ ||
+             normal_add.norm() < config_setting_.plane_merge_normal_thre_) &&
+            dis1 < config_setting_.plane_merge_dis_thre_ &&
             dis2 < config_setting_.plane_merge_dis_thre_) {
-          if ((*iter)->id_ == 0 && (*iter2)->id_ == 0) {
-            (*iter)->id_ = current_id;
-            (*iter2)->id_ = current_id;
-            current_id++;
-          } else if ((*iter)->id_ == 0 && (*iter2)->id_ != 0)
-            (*iter)->id_ = (*iter2)->id_;
-          else if ((*iter)->id_ != 0 && (*iter2)->id_ == 0)
-            (*iter2)->id_ = (*iter)->id_;
+          uf.unionSet(i, j);  // 合并满足条件的平面
         }
+      }
     }
   }
-  std::vector<int> merge_flag;
 
+  // 第二遍遍历：按root聚类
+  std::unordered_map<int, std::vector<size_t>> clusters;
   for (size_t i = 0; i < origin_list.size(); i++) {
-    auto it =
-        std::find(merge_flag.begin(), merge_flag.end(), origin_list[i]->id_);
-    if (it != merge_flag.end()) continue;
-    if (origin_list[i]->id_ == 0) {
-      merge_plane_list.push_back(origin_list[i]);
-      continue;
-    }
-    std::shared_ptr<Plane> merge_plane(new Plane);
-    (*merge_plane) = (*origin_list[i]);
-    bool is_merge = false;
-    for (size_t j = 0; j < origin_list.size(); j++) {
-      if (i == j) continue;
-      if (origin_list[j]->id_ == origin_list[i]->id_) {
-        is_merge = true;
-        Eigen::Matrix3d P_PT1 =
-            (merge_plane->covariance_ +
-             merge_plane->center_ * merge_plane->center_.transpose()) *
-            merge_plane->points_size_;
-        Eigen::Matrix3d P_PT2 =
+    int root = uf.find(i);
+    clusters[root].push_back(i);
+  }
+
+  // 对每个聚类重新计算合并后的Plane
+  merge_plane_list.clear();
+  for (auto &cluster : clusters) {
+    if (cluster.second.size() == 1) {
+      // 单独的平面，不合并
+      merge_plane_list.push_back(origin_list[cluster.second[0]]);
+      origin_list[cluster.second[0]]->id_ = 0;
+    } else {
+      // 多个平面需要合并
+      std::shared_ptr<Plane> merge_plane(new Plane);
+      *merge_plane = *origin_list[cluster.second[0]];
+
+      Eigen::Matrix3d P_PT_sum =
+          (merge_plane->covariance_ +
+           merge_plane->center_ * merge_plane->center_.transpose()) *
+          merge_plane->points_size_;
+      Eigen::Vector3d center_sum =
+          merge_plane->center_ * merge_plane->points_size_;
+      int total_points = merge_plane->points_size_;
+
+      for (size_t idx = 1; idx < cluster.second.size(); idx++) {
+        size_t j = cluster.second[idx];
+        P_PT_sum +=
             (origin_list[j]->covariance_ +
              origin_list[j]->center_ * origin_list[j]->center_.transpose()) *
             origin_list[j]->points_size_;
-        Eigen::Vector3d merge_center =
-            (merge_plane->center_ * merge_plane->points_size_ +
-             origin_list[j]->center_ * origin_list[j]->points_size_) /
-            (merge_plane->points_size_ + origin_list[j]->points_size_);
-        Eigen::Matrix3d merge_covariance =
-            (P_PT1 + P_PT2) /
-                (merge_plane->points_size_ + origin_list[j]->points_size_) -
-            merge_center * merge_center.transpose();
-        merge_plane->covariance_ = merge_covariance;
-        merge_plane->center_ = merge_center;
-        merge_plane->points_size_ =
-            merge_plane->points_size_ + origin_list[j]->points_size_;
-        merge_plane->sub_plane_num_ += origin_list[j]->sub_plane_num_;
-        Eigen::EigenSolver<Eigen::Matrix3d> es(merge_plane->covariance_);
-        Eigen::Matrix3cd evecs = es.eigenvectors();
-        Eigen::Vector3cd evals = es.eigenvalues();
-        Eigen::Vector3d evalsReal;
-        evalsReal = evals.real();
-        Eigen::Matrix3f::Index evalsMin, evalsMax;
-        evalsReal.rowwise().sum().minCoeff(&evalsMin);
-        evalsReal.rowwise().sum().maxCoeff(&evalsMax);
-        Eigen::Vector3d evecMin = evecs.real().col(evalsMin);
-        merge_plane->normal_ << evecs.real()(0, evalsMin),
-            evecs.real()(1, evalsMin), evecs.real()(2, evalsMin);
-        merge_plane->radius_ = sqrt(evalsReal(evalsMax));
-        merge_plane->d_ = -(merge_plane->normal_(0) * merge_plane->center_(0) +
-                            merge_plane->normal_(1) * merge_plane->center_(1) +
-                            merge_plane->normal_(2) * merge_plane->center_(2));
-        merge_plane->p_center_.x = merge_plane->center_(0);
-        merge_plane->p_center_.y = merge_plane->center_(1);
-        merge_plane->p_center_.z = merge_plane->center_(2);
-        merge_plane->p_center_.normal_x = merge_plane->normal_(0);
-        merge_plane->p_center_.normal_y = merge_plane->normal_(1);
-        merge_plane->p_center_.normal_z = merge_plane->normal_(2);
+        center_sum += origin_list[j]->center_ * origin_list[j]->points_size_;
+        total_points += origin_list[j]->points_size_;
       }
-    }
-    if (is_merge) {
-      merge_flag.push_back(merge_plane->id_);
+
+      Eigen::Vector3d merge_center = center_sum / total_points;
+      Eigen::Matrix3d merge_covariance =
+          P_PT_sum / total_points - merge_center * merge_center.transpose();
+
+      merge_plane->covariance_ = merge_covariance;
+      merge_plane->center_ = merge_center;
+      merge_plane->points_size_ = total_points;
+      merge_plane->sub_plane_num_ = cluster.second.size();
+
+      // 重新计算法向量和半径
+      Eigen::EigenSolver<Eigen::Matrix3d> es(merge_plane->covariance_);
+      Eigen::Matrix3cd evecs = es.eigenvectors();
+      Eigen::Vector3cd evals = es.eigenvalues();
+      Eigen::Vector3d evalsReal = evals.real();
+      Eigen::Matrix3d::Index evalsMin, evalsMax;
+      evalsReal.rowwise().sum().minCoeff(&evalsMin);
+      evalsReal.rowwise().sum().maxCoeff(&evalsMax);
+
+      merge_plane->normal_ << evecs.real()(0, evalsMin),
+          evecs.real()(1, evalsMin), evecs.real()(2, evalsMin);
+      merge_plane->min_eigen_value_ = evalsReal(evalsMin);
+      merge_plane->radius_ = sqrt(evalsReal(evalsMax));
+      merge_plane->d_ = -(merge_plane->normal_(0) * merge_plane->center_(0) +
+                         merge_plane->normal_(1) * merge_plane->center_(1) +
+                         merge_plane->normal_(2) * merge_plane->center_(2));
+
+      merge_plane->p_center_.x = merge_plane->center_(0);
+      merge_plane->p_center_.y = merge_plane->center_(1);
+      merge_plane->p_center_.z = merge_plane->center_(2);
+      merge_plane->p_center_.normal_x = merge_plane->normal_(0);
+      merge_plane->p_center_.normal_y = merge_plane->normal_(1);
+      merge_plane->p_center_.normal_z = merge_plane->normal_(2);
+
+      // 设置合并后的Plane ID
+      merge_plane->id_ = cluster.first + 1;  // 使用root+1作为新ID
       merge_plane_list.push_back(merge_plane);
     }
   }
+
+  return;
 }
 
 void BtcDescManager::binary_extractor(
@@ -682,6 +762,7 @@ void BtcDescManager::binary_extractor(
     std::vector<BinaryDescriptor> prepare_binary_list;
     Eigen::Vector3d proj_center = proj_plane_list[i]->center_;
     Eigen::Vector3d proj_normal = proj_plane_list[i]->normal_;
+    int plane_id = proj_plane_list[i]->id_;  // P2-1: 使用Plane的ID
     if (proj_normal.z() < 0) {
       proj_normal = -proj_normal;
     }
@@ -695,7 +776,7 @@ void BtcDescManager::binary_extractor(
       }
       useful_proj_num++;
       extract_binary(proj_center, proj_normal, input_cloud,
-                     prepare_binary_list);
+                     prepare_binary_list, plane_id);  // P0-1: 传入plane_id
       for (auto bi : prepare_binary_list) {
         temp_binary_list.push_back(bi);
       }
@@ -721,7 +802,8 @@ void BtcDescManager::extract_binary(
     const Eigen::Vector3d &project_center,
     const Eigen::Vector3d &project_normal,
     const pcl::PointCloud<pcl::PointXYZI>::Ptr &input_cloud,
-    std::vector<BinaryDescriptor> &binary_list) {
+    std::vector<BinaryDescriptor> &binary_list,
+    int plane_id) {
   binary_list.clear();
   double binary_min_dis = config_setting_.summary_min_thre_;
   double resolution = config_setting_.proj_image_resolution_;
@@ -735,18 +817,16 @@ void BtcDescManager::extract_binary(
   double D =
       -(A * project_center[0] + B * project_center[1] + C * project_center[2]);
   std::vector<Eigen::Vector3d> projection_points;
-  Eigen::Vector3d x_axis(1, 0, 0);
-  if (C != 0) {
-    x_axis[2] = -(A + B) / C;
-  } else if (B != 0) {
-    x_axis[1] = -A / B;
+
+  // P0-2: 使用Gram-Schmidt方法生成稳定的局部坐标系，避免数值退化
+  Eigen::Vector3d ref;
+  if (fabs(project_normal.z()) < 0.9) {
+    ref = Eigen::Vector3d(0, 0, 1);  // 当法向不接近Z轴时，用Z轴作为参考
   } else {
-    x_axis[0] = 0;
-    x_axis[1] = 1;
+    ref = Eigen::Vector3d(1, 0, 0);  // 当法向接近Z轴时，用X轴作为参考
   }
-  x_axis.normalize();
-  Eigen::Vector3d y_axis = project_normal.cross(x_axis);
-  y_axis.normalize();
+  Eigen::Vector3d x_axis = project_normal.cross(ref).normalized();
+  Eigen::Vector3d y_axis = project_normal.cross(x_axis).normalized();
   double ax = x_axis[0];
   double bx = x_axis[1];
   double cx = x_axis[2];
@@ -824,38 +904,20 @@ void BtcDescManager::extract_binary(
   int x_axis_len = (int)((max_x - min_x) / resolution + segmen_base_num);
   int y_axis_len = (int)((max_y - min_y) / resolution + segmen_base_num);
 
-  std::vector<double> **dis_container = new std::vector<double> *[x_axis_len];
-  BinaryDescriptor **binary_container = new BinaryDescriptor *[x_axis_len];
-  for (int i = 0; i < x_axis_len; i++) {
-    dis_container[i] = new std::vector<double>[y_axis_len];
-    binary_container[i] = new BinaryDescriptor[y_axis_len];
-  }
-  double **img_count = new double *[x_axis_len];
-  for (int i = 0; i < x_axis_len; i++) {
-    img_count[i] = new double[y_axis_len];
-  }
-  double **dis_array = new double *[x_axis_len];
-  for (int i = 0; i < x_axis_len; i++) {
-    dis_array[i] = new double[y_axis_len];
-  }
-  double **mean_x_list = new double *[x_axis_len];
-  for (int i = 0; i < x_axis_len; i++) {
-    mean_x_list[i] = new double[y_axis_len];
-  }
-  double **mean_y_list = new double *[x_axis_len];
-  for (int i = 0; i < x_axis_len; i++) {
-    mean_y_list[i] = new double[y_axis_len];
-  }
-  for (int x = 0; x < x_axis_len; x++) {
-    for (int y = 0; y < y_axis_len; y++) {
-      img_count[x][y] = 0;
-      mean_x_list[x][y] = 0;
-      mean_y_list[x][y] = 0;
-      dis_array[x][y] = 0;
-      std::vector<double> single_dis_container;
-      dis_container[x][y] = single_dis_container;
-    }
-  }
+  // 修复内存泄漏：使用std::vector替代原始指针的二维数组
+  // 即使有提前返回或异常，STL也会自动释放内存
+  std::vector<std::vector<std::vector<double>>> dis_container(
+      x_axis_len, std::vector<std::vector<double>>(y_axis_len));
+  std::vector<std::vector<BinaryDescriptor>> binary_container(
+      x_axis_len, std::vector<BinaryDescriptor>(y_axis_len));
+  std::vector<std::vector<double>> img_count(
+      x_axis_len, std::vector<double>(y_axis_len, 0.0));
+  std::vector<std::vector<double>> dis_array(
+      x_axis_len, std::vector<double>(y_axis_len, 0.0));
+  std::vector<std::vector<double>> mean_x_list(
+      x_axis_len, std::vector<double>(y_axis_len, 0.0));
+  std::vector<std::vector<double>> mean_y_list(
+      x_axis_len, std::vector<double>(y_axis_len, 0.0));
 
   for (size_t i = 0; i < point_list_2d.size(); i++) {
     int x_index = (int)((point_list_2d[i][0] - min_x) / resolution);
@@ -892,6 +954,8 @@ void BtcDescManager::extract_binary(
         dis_array[x][y] = segmnt_dis;
         single_binary.occupy_array_ = occup_list;
         single_binary.summary_ = segmnt_dis;
+        single_binary.normal_ = project_normal;  // P0-1: 保存投影平面的法向量
+        single_binary.plane_id_ = plane_id;  // P2-1: 保存投影平面的ID
         binary_container[x][y] = single_binary;
       }
     }
@@ -993,20 +1057,7 @@ void BtcDescManager::extract_binary(
       binary_list.push_back(single_binary);
     }
   }
-  for (int i = 0; i < x_axis_len; i++) {
-    delete[] binary_container[i];
-    delete[] dis_container[i];
-    delete[] img_count[i];
-    delete[] dis_array[i];
-    delete[] mean_x_list[i];
-    delete[] mean_y_list[i];
-  }
-  delete[] binary_container;
-  delete[] dis_container;
-  delete[] img_count;
-  delete[] dis_array;
-  delete[] mean_x_list;
-  delete[] mean_y_list;
+  // 修复内存泄漏：使用std::vector后，无需手动delete，STL自动管理内存
 }
 
 void BtcDescManager::non_maxi_suppression(
@@ -1029,6 +1080,8 @@ void BtcDescManager::non_maxi_suppression(
   std::vector<int> pointIdxRadiusSearch;
   std::vector<float> pointRadiusSquaredDistance;
   double radius = config_setting_.non_max_suppression_radius_;
+  double score_margin = config_setting_.nms_score_margin_;  // P1-4: NMS score margin
+
   for (size_t i = 0; i < prepare_key_cloud->size(); i++) {
     pcl::PointXYZ searchPoint = prepare_key_cloud->points[i];
     if (kd_tree.radiusSearch(searchPoint, radius, pointIdxRadiusSearch,
@@ -1042,8 +1095,11 @@ void BtcDescManager::non_maxi_suppression(
         if (pointIdxRadiusSearch[j] == i) {
           continue;
         }
-        if (pre_count_list[i] <= pre_count_list[pointIdxRadiusSearch[j]]) {
+        // P1-4: 只有邻居score > 自己score + margin时才删除，避免大量误删
+        if (pre_count_list[pointIdxRadiusSearch[j]] >
+            pre_count_list[i] + score_margin) {
           is_add_list[i] = false;
+          break;  // 已经确定要删除，不需要继续检查其他邻居
         }
       }
     }
@@ -1185,6 +1241,10 @@ void BtcDescManager::generate_btc(
             single_descriptor.binary_C_ = binary_C;
             single_descriptor.center_ = (A + B + C) / 3;
             single_descriptor.triangle_ << scale * a, scale * b, scale * c;
+            // P0-1: 修复法向量未初始化问题，从BinaryDescriptor中获取法向量
+            normal_1 = binary_A.normal_;
+            normal_2 = binary_B.normal_;
+            normal_3 = binary_C.normal_;
             single_descriptor.angle_[0] = fabs(5 * normal_1.dot(normal_2));
             single_descriptor.angle_[1] = fabs(5 * normal_1.dot(normal_3));
             single_descriptor.angle_[2] = fabs(5 * normal_3.dot(normal_2));
@@ -1208,7 +1268,8 @@ void BtcDescManager::candidate_selector(
   int current_frame_id = current_STD_list[0].frame_number_;
   int outlier = 0;
   double max_dis = 50;
-  double match_array[20000] = {0};
+  // 修复数组越界：改用unordered_map，避免硬编码20000帧上限
+  std::unordered_map<int, int> match_votes;  // frame_number -> vote count
   std::vector<std::pair<BTC, BTC>> match_list;
   std::vector<int> match_list_index;
   std::vector<Eigen::Vector3i> voxel_round;
@@ -1233,6 +1294,8 @@ void BtcDescManager::candidate_selector(
 
   int query_num = 0;
   int pass_num = 0;
+  // P1-1: 使用可配置hash分辨率
+  double hash_resolution = config_setting_.std_side_resolution_;
   std::for_each(
       std::execution::par_unseq, index.begin(), index.end(),
       [&](const size_t &i) {
@@ -1244,13 +1307,14 @@ void BtcDescManager::candidate_selector(
             descriptor.triangle_.norm() *
             config_setting_.rough_dis_threshold_;
         for (auto voxel_inc : voxel_round) {
-          position.x = (int)(descriptor.triangle_[0] + voxel_inc[0]);
-          position.y = (int)(descriptor.triangle_[1] + voxel_inc[1]);
-          position.z = (int)(descriptor.triangle_[2] + voxel_inc[2]);
-          Eigen::Vector3d voxel_center((double)position.x + 0.5,
-                                       (double)position.y + 0.5,
-                                       (double)position.z + 0.5);
-          if ((descriptor.triangle_ - voxel_center).norm() < 1.5) {
+          // P1-1: 改用可配置量化，与AddBtcDescs保持一致
+          position.x = (int)(descriptor.triangle_[0] / hash_resolution) + voxel_inc[0];
+          position.y = (int)(descriptor.triangle_[1] / hash_resolution) + voxel_inc[1];
+          position.z = (int)(descriptor.triangle_[2] / hash_resolution) + voxel_inc[2];
+          Eigen::Vector3d voxel_center((double)position.x * hash_resolution + hash_resolution / 2,
+                                       (double)position.y * hash_resolution + hash_resolution / 2,
+                                       (double)position.z * hash_resolution + hash_resolution / 2);
+          if ((descriptor.triangle_ - voxel_center).norm() < 1.5 * hash_resolution) {
             auto iter = data_base_.find(position);
             if (iter != data_base_.end()) {
               bool is_push_position = false;
@@ -1287,9 +1351,10 @@ void BtcDescManager::candidate_selector(
   for (size_t i = 0; i < useful_match.size(); i++) {
     if (useful_match[i]) {
       for (size_t j = 0; j < useful_match_index[i].size(); j++) {
-        match_array[data_base_[useful_match_position[i][j]]
-                              [useful_match_index[i][j]]
-                                  .frame_number_] += 1;
+        // 修复数组越界：使用unordered_map累加投票
+        match_votes[data_base_[useful_match_position[i][j]]
+                        [useful_match_index[i][j]]
+                            .frame_number_] += 1;
         Eigen::Vector2i match_index(i, j);
         index_recorder.push_back(match_index);
         match_list_index.push_back(
@@ -1310,7 +1375,8 @@ void BtcDescManager::candidate_selector(
               single_match_pair.second = data_base_[useful_match_position[i][j]]
                                                    [useful_match_index[i][j]];
               mylock.lock();
-              match_array[single_match_pair.second.frame_number_] += 1;
+              // 修复数组越界：使用unordered_map累加投票
+              match_votes[single_match_pair.second.frame_number_]++;
               match_list.push_back(single_match_pair);
               match_list_index.push_back(
                   single_match_pair.second.frame_number_);
@@ -1323,15 +1389,16 @@ void BtcDescManager::candidate_selector(
   for (int cnt = 0; cnt < config_setting_.candidate_num_; cnt++) {
     double max_vote = 1;
     int max_vote_index = -1;
-    for (int i = 0; i < 20000; i++) {
-      if (match_array[i] > max_vote) {
-        max_vote = match_array[i];
-        max_vote_index = i;
+    // 修复数组越界：遍历unordered_map找最大投票
+    for (const auto& vote_pair : match_votes) {
+      if (vote_pair.second > max_vote) {
+        max_vote = vote_pair.second;
+        max_vote_index = vote_pair.first;
       }
     }
     BTCMatchList match_triangle_list;
     if (max_vote_index >= 0 && max_vote >= 5) {
-      match_array[max_vote_index] = 0;
+      match_votes[max_vote_index] = 0;  // 清零已选中的候选
       match_triangle_list.match_frame_ = max_vote_index;
       match_triangle_list.match_id_.first = current_frame_id;
       match_triangle_list.match_id_.second = max_vote_index;
@@ -1358,6 +1425,59 @@ void BtcDescManager::candidate_verify(
     std::pair<Eigen::Vector3d, Eigen::Matrix3d> &relative_pose,
     std::vector<std::pair<BTC, BTC>> &sucess_match_list) {
   sucess_match_list.clear();
+
+  // P2-3: 增加几何一致性过滤，减少ICP误收敛
+  // 计算三角形边长方差和中心分布
+  if (candidate_matcher.match_list_.size() < 5) {
+    verify_score = -1;
+    return;
+  }
+
+  // 计算triangle side的均值和方差
+  double side_mean = 0;
+  double side_var = 0;
+  for (const auto &match : candidate_matcher.match_list_) {
+    side_mean += match.first.triangle_.norm();
+  }
+  side_mean /= candidate_matcher.match_list_.size();
+
+  for (const auto &match : candidate_matcher.match_list_) {
+    double diff = match.first.triangle_.norm() - side_mean;
+    side_var += diff * diff;
+  }
+  side_var /= candidate_matcher.match_list_.size();
+  double side_std = sqrt(side_var);
+
+  // 计算center分布的均值和方差
+  Eigen::Vector3d center_mean(0, 0, 0);
+  double center_var = 0;
+  for (const auto &match : candidate_matcher.match_list_) {
+    center_mean += match.first.center_;
+  }
+  center_mean /= candidate_matcher.match_list_.size();
+
+  for (const auto &match : candidate_matcher.match_list_) {
+    double diff = (match.first.center_ - center_mean).norm();
+    center_var += diff * diff;
+  }
+  center_var /= candidate_matcher.match_list_.size();
+  double center_std = sqrt(center_var);
+
+  // 几何一致性阈值（可配置）
+  double max_side_std_threshold = 3.0;   // 边长标准差阈值
+  double max_center_std_threshold = 10.0;  // 中心分布标准差阈值
+
+  if (side_std > max_side_std_threshold || center_std > max_center_std_threshold) {
+    if (print_debug_info_) {
+      std::cout << "[Verify] Geometric consistency check failed: "
+                << "side_std=" << side_std << " (threshold=" << max_side_std_threshold << "), "
+                << "center_std=" << center_std << " (threshold=" << max_center_std_threshold << ")"
+                << std::endl;
+    }
+    verify_score = -1;
+    return;
+  }
+
   double dis_threshold = 3;
   std::time_t solve_time = 0;
   std::time_t verify_time = 0;

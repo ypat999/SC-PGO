@@ -1,0 +1,49 @@
+%YAML:1.0
+# BTC 配置 - Livox Mid360 固态雷达专用
+# Mid360特点：
+# - 非重复扫描模式，点云分布不均匀
+# - 视场角：360°水平，-7°~52°垂直（垂直范围较小）
+# - 点云密度相对较低（~20000点/帧）
+# - 固态雷达，无机械旋转，扫描模式特殊
+
+# ========== 平面检测参数（极低阈值适应mid360）==========
+cloud_ds_size: 0.15  # 降低点云下采样（mid360点云少）
+
+voxel_size: 0.2  # 极低体素大小（mid360稀疏）
+voxel_init_num: 1  # 极低阈值（允许1个点即可形成体素）
+plane_detection_thre: 0.03  # 放宽平面拟合（适应非重复扫描）
+
+# ========== 平面合并参数（大幅放宽）==========
+plane_merge_normal_thre: 0.2  # 放宽法向量（mid360噪声较大）
+plane_merge_dis_thre: 0.8  # 放宽距离阈值
+
+# ========== 二进制描述子参数（适应小视场角）==========
+proj_plane_num: 3  # 降低（mid360垂直视场角小，减少投影方向）
+proj_dis_min: 0
+proj_dis_max: 8  # 增加（适应mid360较远目标）
+proj_image_resolution: 0.8  # 增加（mid360稀疏）
+proj_image_high_inc: 0.8
+summary_min_thre: 2  # 极低阈值（mid360特征少）
+line_filter_enable: 0
+
+# ========== BTC 生成参数（极宽松）==========
+descriptor_near_num: 3  # 极低（mid360特征稀疏）
+descriptor_min_len: 0.3  # 极低最小边长
+descriptor_max_len: 20  # 增加最大边长
+useful_corner_num: 10  # 极低（mid360角点少）
+non_max_suppression_radius: 2.0  # 降低（适应稀疏特征）
+
+# ========== 回环检测参数（降低跳过阈值）==========
+skip_near_num: 3  # 降低（mid360关键帧少，不能跳过太多）
+candidate_num: 30  # 降低候选数（减少计算量）
+sub_frame_num: 5  # 降低子帧数
+
+# ========== 验证参数（宽松验证）==========
+rough_dis_threshold: 0.08  # 大幅放宽
+similarity_threshold: 0.5  # 大幅放宽
+icp_threshold: 0.8  # 大幅放宽（mid360匹配困难）
+
+# ========== 其他参数（宽松）==========
+normal_threshold: 0.2  # 放宽
+dis_threshold: 0.8  # 放宽
+triangle_resolution: 0.5  # 放宽

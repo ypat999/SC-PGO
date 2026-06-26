@@ -21,48 +21,104 @@
 #define MAX_N 10000000000
 
 typedef struct ConfigSetting {
+  // ========== 平面检测参数（通用适配默认值 - 优化版）==========
   double cloud_ds_size_ = 0.25;
-
-  int useful_corner_num_ = 30;
-  float plane_merge_normal_thre_;
-  float plane_merge_dis_thre_;
+  
   float plane_detection_thre_ = 0.01;
-  float voxel_size_ = 1.0;
-  int voxel_init_num_ = 10;
-  int proj_plane_num_ = 1;
+  float voxel_size_ = 0.5;  // 降低以增加体素密度（原1.0导致体素内点数不足）
+  int voxel_init_num_ = 3;  // 降低以适应稀疏点云（原5阈值过高）
+  
+  // ========== 平面合并参数 ==========
+  float plane_merge_normal_thre_ = 0.1;
+  float plane_merge_dis_thre_ = 0.3;
+  float plane_merge_search_radius_ = 2.0;  // P1-3: KDTree邻域搜索半径，替代全局O(N²)比较
+  
+  // ========== 二进制描述子参数 ==========
+  int proj_plane_num_ = 5;  // 增加多方向投影
   float proj_image_resolution_ = 0.5;
   float proj_image_high_inc_ = 0.5;
   float proj_dis_min_ = 0;
   float proj_dis_max_ = 5;
-  float summary_min_thre_ = 10;
+  float summary_min_thre_ = 3;  // 降低以适应单层扫描
   int line_filter_enable_ = 0;
-
-  float descriptor_near_num_ = 10;
+  
+  // ========== BTC 生成参数 ==========
+  float descriptor_near_num_ = 5;  // 降低允许较少描述子生成三角形
   float descriptor_min_len_ = 1;
   float descriptor_max_len_ = 10;
   float non_max_suppression_radius_ = 3.0;
+  float nms_score_margin_ = 1.0;  // P1-4: NMS score margin，避免大量descriptor被误删
   float std_side_resolution_ = 0.2;
-
-  int skip_near_num_ = 20;
+  
+  int useful_corner_num_ = 20;  // 降低
+  
+  // ========== 回环检测参数 ==========
+  int skip_near_num_ = 5;  // 降低因静态场景帧间距离极小
   int candidate_num_ = 50;
   int sub_frame_num_ = 10;
+  
+  // ========== 验证参数 ==========
   float rough_dis_threshold_ = 0.03;
   float similarity_threshold_ = 0.7;
   float icp_threshold_ = 0.5;
   float normal_threshold_ = 0.1;
   float dis_threshold_ = 0.3;
-
+  int icp_min_match_num_ = 20;  // P2-2: ICP最小有效匹配数，避免退化优化
+  float triangle_resolution_ = 0.2;
+  
+  // ========== 外参参数 ==========
   Eigen::Matrix3d rot_lidar_to_vehicle_;
   Eigen::Vector3d t_lidar_to_vehicle_;
-
+  
   int gt_file_style_ = 0;
 
 } ConfigSetting;
+
+// P0-3: Union-Find (Disjoint Set) 数据结构，用于真正的连通域合并
+class UnionFind {
+ private:
+  std::vector<int> parent_;
+  std::vector<int> rank_;
+
+ public:
+  UnionFind(int n) {
+    parent_.resize(n);
+    rank_.resize(n, 0);
+    for (int i = 0; i < n; i++) {
+      parent_[i] = i;
+    }
+  }
+
+  int find(int x) {
+    if (parent_[x] != x) {
+      parent_[x] = find(parent_[x]);  // 路径压缩
+    }
+    return parent_[x];
+  }
+
+  void unionSet(int x, int y) {
+    int root_x = find(x);
+    int root_y = find(y);
+    if (root_x != root_y) {
+      // 按秩合并
+      if (rank_[root_x] < rank_[root_y]) {
+        parent_[root_x] = root_y;
+      } else if (rank_[root_x] > rank_[root_y]) {
+        parent_[root_y] = root_x;
+      } else {
+        parent_[root_y] = root_x;
+        rank_[root_x]++;
+      }
+    }
+  }
+};
 
 typedef struct BinaryDescriptor {
   std::vector<bool> occupy_array_;
   unsigned char summary_;
   Eigen::Vector3d location_;
+  Eigen::Vector3d normal_;  // P0-1: 保存对应参考平面的法向量，避免generate_btc中的未定义行为
+  int plane_id_;  // P2-1: 保存参考Plane ID，方便debug和可视化
 } BinaryDescriptor;
 
 typedef struct BTC {
@@ -293,7 +349,8 @@ class BtcDescManager {
   void extract_binary(const Eigen::Vector3d &project_center,
                       const Eigen::Vector3d &project_normal,
                       const pcl::PointCloud<pcl::PointXYZI>::Ptr &input_cloud,
-                      std::vector<BinaryDescriptor> &binary_list);
+                      std::vector<BinaryDescriptor> &binary_list,
+                      int plane_id = -1);
 
   void non_maxi_suppression(std::vector<BinaryDescriptor> &binary_list);
 

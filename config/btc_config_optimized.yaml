@@ -1,0 +1,42 @@
+%YAML:1.0
+# BTC 配置 - 优化版（针对稀疏点云场景）
+# 问题诊断：voxel_size=0.5时，体素数≈85k，平均每体素0.22点，远低于voxel_init_num=3
+# 优化策略：进一步降低voxel_size和voxel_init_num，放宽平面检测条件
+
+# ========== 平面检测参数（进一步优化）==========
+voxel_size: 0.3  # 进一步降低（0.5→0.3，体素数增2.8倍）
+voxel_init_num: 2  # 进一步降低（3→2，放宽体素内最小点数）
+plane_detection_thre: 0.02  # 放宽平面拟合阈值（0.01→0.02）
+
+# ========== 平面合并参数（放宽条件）==========
+plane_merge_normal_thre: 0.15  # 放宽法向量阈值（0.1→0.15）
+plane_merge_dis_thre: 0.5  # 放宽距离阈值（0.3→0.5）
+
+# ========== 二进制描述子参数 ==========
+proj_plane_num: 5  # 保持多方向投影
+proj_dis_min: 0
+proj_dis_max: 5
+proj_image_resolution: 0.5
+proj_image_high_inc: 0.5
+summary_min_thre: 3  # 保持（已足够低）
+line_filter_enable: 0
+
+# ========== BTC 生成参数（放宽三角形生成条件）==========
+descriptor_near_num: 4  # 进一步降低（5→4）
+descriptor_min_len: 0.5  # 降低最小边长（1→0.5）
+descriptor_max_len: 15  # 增加最大边长（10→15）
+useful_corner_num: 15  # 进一步降低（20→15）
+
+# ========== 回环检测参数 ==========
+skip_near_num: 5  # 保持
+candidate_num: 50
+
+# ========== 验证参数（放宽验证条件）==========
+rough_dis_threshold: 0.05  # 放宽（0.03→0.05）
+similarity_threshold: 0.6  # 放宽（0.7→0.6）
+icp_threshold: 0.6  # 放宽（0.5→0.6）
+
+# ========== 其他参数 ==========
+normal_threshold: 0.15  # 放宽（0.1→0.15）
+dis_threshold: 0.5  # 放宽（0.3→0.5）
+triangle_resolution: 0.3  # 放宽（0.2→0.3）

@@ -5,6 +5,9 @@ set(CMAKE_BUILD_TYPE "Release")
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -Wall -g")
 
+# Python binding option (默认开启，确保离线脚本可直接调用C++ BTC)
+option(BUILD_PYTHON_BINDING "Build Python binding for BTC" ON)
+
 find_package(ament_cmake REQUIRED)
 find_package(ament_index_cpp REQUIRED)
 find_package(rclcpp REQUIRED)
@@ -25,6 +28,13 @@ find_package(pcl_msgs REQUIRED)   # usually needed alongside
 
 # ndt_omp_ros2 dependency for GICP_OMP
 find_package(ndt_omp_ros2 REQUIRED)
+
+# Python binding dependencies (可选)
+if(BUILD_PYTHON_BINDING)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
+  find_package(pybind11 REQUIRED)
+  message(STATUS "Python binding enabled - Python3: ${Python3_VERSION}, pybind11: ${pybind11_VERSION}")
+endif()
 
 include_directories(
   include
@@ -64,4 +74,35 @@ install(
   DIRECTORY rviz_cfg config
   DESTINATION share/${PROJECT_NAME}
 )
+
+# ==================== Python Binding (可选) ====================
+if(BUILD_PYTHON_BINDING)
+  # Python绑定共享库
+  pybind11_add_module(btc_cpp
+    src/btc_python_binding.cpp
+    src/btc.cpp
+  )
+
+  target_link_libraries(btc_cpp
+    PRIVATE
+    ${PCL_LIBRARIES}
+    ${CERES_LIBRARIES}
+    ${OpenCV_LIBS}  # 添加OpenCV库链接（解决undefined symbol问题）
+  )
+
+  target_include_directories(btc_cpp
+    PRIVATE
+    ${PCL_INCLUDE_DIRS}
+    ${CERES_INCLUDE_DIRS}
+    ${OpenCV_INCLUDE_DIRS}
+  )
+
+  # 安装Python模块到本地目录（避免权限问题）
+  install(TARGETS btc_cpp
+    LIBRARY DESTINATION lib/python3/dist-packages  # 使用项目lib目录
+  )
+
+  message(STATUS "Python binding 'btc_cpp' will be installed to: lib/python3/dist-packages")
+endif()
+
 ament_package()
