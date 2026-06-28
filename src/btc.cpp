@@ -27,7 +27,7 @@ void load_config_setting(std::string &config_file,
   config_setting.descriptor_near_num_ = fSettings["descriptor_near_num"];
   config_setting.descriptor_min_len_ = fSettings["descriptor_min_len"];
   config_setting.descriptor_max_len_ = fSettings["descriptor_max_len"];
-  config_setting.non_max_suppression_radius_ = fSettings["max_constrait_dis"];
+  config_setting.non_max_suppression_radius_ = fSettings["non_max_suppression_radius"];
   config_setting.std_side_resolution_ = fSettings["triangle_resolution"];
 
   config_setting.skip_near_num_ = fSettings["skip_near_num"];
@@ -37,6 +37,15 @@ void load_config_setting(std::string &config_file,
   config_setting.icp_threshold_ = fSettings["icp_threshold"];
   config_setting.normal_threshold_ = fSettings["normal_threshold"];
   config_setting.dis_threshold_ = fSettings["dis_threshold"];
+  config_setting.geom_side_std_threshold_ = fSettings["geom_side_std_threshold"];
+  config_setting.geom_center_std_threshold_ = fSettings["geom_center_std_threshold"];
+  config_setting.ransac_min_vote_ = fSettings["ransac_min_vote"];
+  config_setting.ransac_max_iterations_ = fSettings["ransac_max_iterations"];
+  config_setting.ransac_sample_max_ = fSettings["ransac_sample_max"];
+  config_setting.ransac_correspondence_dis_ = fSettings["ransac_correspondence_dis"];
+  config_setting.candidate_selector_min_vote_ = fSettings["candidate_selector_min_vote"];
+  config_setting.candidate_verify_min_pairs_ = fSettings["candidate_verify_min_pairs"];
+  config_setting.icp_point_to_point_max_ = fSettings["icp_point_to_point_max"];
 
   std::cout << "Sucessfully load config file:" << config_file << std::endl;
 }
@@ -216,9 +225,9 @@ void BtcDescManager::GenerateBtcDescs(
   pcl::PointCloud<pcl::PointXYZINormal>::Ptr plane_cloud(
       new pcl::PointCloud<pcl::PointXYZINormal>);
   get_plane(voxel_map, plane_cloud);
-  if (print_debug_info_) {
-    std::cout << "[Description] planes size:" << plane_cloud->size()
-              << std::endl;
+  if (config_setting_.print_debug_info_) {
+    std::cout << "[BTC Gen] frame=" << frame_id 
+              << ", planes=" << plane_cloud->size() << std::endl;
   }
 
   plane_cloud_vec_.push_back(plane_cloud);
@@ -243,27 +252,26 @@ void BtcDescManager::GenerateBtcDescs(
 
   // P2-4: 增加调试统计信息 - 合并后平面数量和合并率
   int merged_plane_num = merge_plane_list.size();
-  if (print_debug_info_) {
+  if (config_setting_.print_debug_info_) {
     float merge_ratio = (original_plane_num > 0) ?
         (1.0f - (float)merged_plane_num / (float)original_plane_num) : 0.0f;
-    std::cout << "[Description] original planes:" << original_plane_num
-              << ", merged planes:" << merged_plane_num
-              << ", merge ratio:" << merge_ratio * 100 << "%"
+    std::cout << "[BTC Gen] original_planes=" << original_plane_num
+              << ", merged_planes=" << merged_plane_num
+              << ", merge_ratio=" << merge_ratio * 100 << "%"
               << std::endl;
   }
 
   std::vector<BinaryDescriptor> binary_list;
   binary_extractor(merge_plane_list, input_cloud, binary_list);
   history_binary_list_.push_back(binary_list);
-  if (print_debug_info_) {
-    std::cout << "[Description] binary size:" << binary_list.size()
-              << std::endl;
+  if (config_setting_.print_debug_info_) {
+    std::cout << "[BTC Gen] binary_descs=" << binary_list.size() << std::endl;
   }
 
   btcs_vec.clear();
   generate_btc(binary_list, frame_id, btcs_vec);
-  if (print_debug_info_) {
-    std::cout << "[Description] btcs size:" << btcs_vec.size() << std::endl;
+  if (config_setting_.print_debug_info_) {
+    std::cout << "[BTC Gen] final_btcs=" << btcs_vec.size() << std::endl;
   }
   for (auto iter = voxel_map.begin(); iter != voxel_map.end(); iter++) {
     delete (iter->second);
@@ -274,7 +282,8 @@ void BtcDescManager::GenerateBtcDescs(
 void BtcDescManager::SearchLoop(
     const std::vector<BTC> &btcs_vec, std::pair<int, double> &loop_result,
     std::pair<Eigen::Vector3d, Eigen::Matrix3d> &loop_transform,
-    std::vector<std::pair<BTC, BTC>> &loop_std_pair) {
+    std::vector<std::pair<BTC, BTC>> &loop_std_pair,
+    const Eigen::Vector3d &current_position) {
   if (btcs_vec.size() == 0) {
     std::cerr << "[BTC] No BTC descs!" << std::endl;
     loop_result = std::pair<int, double>(-1, 0);
@@ -282,7 +291,13 @@ void BtcDescManager::SearchLoop(
   }
   auto t1 = std::chrono::high_resolution_clock::now();
   std::vector<BTCMatchList> candidate_matcher_vec;
-  candidate_selector(btcs_vec, candidate_matcher_vec);
+  candidate_selector(btcs_vec, candidate_matcher_vec, current_position);
+
+  // 收集候选帧ID用于诊断
+  last_candidate_ids_.clear();
+  for (auto& cm : candidate_matcher_vec) {
+      last_candidate_ids_.push_back(cm.match_id_.second);
+  }
 
   auto t2 = std::chrono::high_resolution_clock::now();
   double best_score = 0;
@@ -296,8 +311,8 @@ void BtcDescManager::SearchLoop(
     std::vector<std::pair<BTC, BTC>> sucess_match_vec;
     candidate_verify(candidate_matcher_vec[i], verify_score, relative_pose,
                      sucess_match_vec);
-    if (print_debug_info_) {
-      std::cout << "[Retreival] try frame:"
+    if (config_setting_.print_debug_info_) {
+      std::cout << "[Retrieval] try frame:"
                 << candidate_matcher_vec[i].match_id_.second << ", rough size:"
                 << candidate_matcher_vec[i].match_list_.size()
                 << ", score:" << verify_score << std::endl;
@@ -313,15 +328,23 @@ void BtcDescManager::SearchLoop(
   }
   auto t3 = std::chrono::high_resolution_clock::now();
 
-  if (print_debug_info_) {
-    std::cout << "[Retreival] best candidate:" << best_candidate_id
-              << ", score:" << best_score << std::endl;
+  if (config_setting_.print_debug_info_) {
+    std::cout << "[Retrieval] best candidate:" << best_candidate_id
+              << ", score:" << best_score 
+              << " (threshold=" << config_setting_.icp_threshold_ << ")" << std::endl;
   }
 
   if (best_score > config_setting_.icp_threshold_) {
     loop_result = std::pair<int, double>(best_candidate_id, best_score);
     loop_transform = best_transform;
     loop_std_pair = best_sucess_match_vec;
+    
+    if (config_setting_.print_debug_info_) {
+      std::cout << "[BTC Loop] 检测到回环! frame=" << best_candidate_id 
+                << "<->" << btcs_vec[0].frame_number_
+                << ", score=" << best_score 
+                << ", match_pairs=" << best_sucess_match_vec.size() << std::endl;
+    }
     return;
   } else {
     loop_result = std::pair<int, double>(-1, 0);
@@ -329,7 +352,8 @@ void BtcDescManager::SearchLoop(
   }
 }
 
-void BtcDescManager::AddBtcDescs(const std::vector<BTC> &btcs_vec) {
+void BtcDescManager::AddBtcDescs(const std::vector<BTC> &btcs_vec,
+                                  const Eigen::Vector3d &frame_position) {
   for (auto single_std : btcs_vec) {
     BTC_LOC position;
     // P1-1: 改用可配置量化，避免bucket太粗导致查询稳定性差
@@ -347,7 +371,12 @@ void BtcDescManager::AddBtcDescs(const std::vector<BTC> &btcs_vec) {
       data_base_[position] = descriptor_vec;
     }
   }
-  return;
+
+  // 新增：存储帧位置（用于搜索时预过滤）
+  if (!btcs_vec.empty()) {
+    int frame_id = btcs_vec[0].frame_number_;
+    frame_positions_[frame_id] = frame_position;
+  }
 }
 
 void BtcDescManager::PlaneGeomrtricIcp(
@@ -406,7 +435,7 @@ void BtcDescManager::PlaneGeomrtricIcp(
       if ((normal_inc.norm() < config_setting_.normal_threshold_ ||
            normal_add.norm() < config_setting_.normal_threshold_) &&
           point_to_plane < config_setting_.dis_threshold_ &&
-          point_to_point_dis < 3) {
+          point_to_point_dis < config_setting_.icp_point_to_point_max_) {
         useful_match++;
         ceres::CostFunction *cost_function;
         Eigen::Vector3d curr_point(source_cloud->points[i].x,
@@ -1264,10 +1293,18 @@ void BtcDescManager::generate_btc(
 
 void BtcDescManager::candidate_selector(
     const std::vector<BTC> &current_STD_list,
-    std::vector<BTCMatchList> &candidate_matcher_vec) {
+    std::vector<BTCMatchList> &candidate_matcher_vec,
+    const Eigen::Vector3d &current_position) {
   int current_frame_id = current_STD_list[0].frame_number_;
   int outlier = 0;
   double max_dis = 50;
+
+  // 统计变量（原子类型，用于并行执行）
+  std::atomic<int> total_hash_hits{0};
+  std::atomic<int> total_skip_near{0};
+  std::atomic<int> total_dis_filter{0};
+  std::atomic<int> total_sim_filter{0};
+
   // 修复数组越界：改用unordered_map，避免硬编码20000帧上限
   std::unordered_map<int, int> match_votes;  // frame_number -> vote count
   std::vector<std::pair<BTC, BTC>> match_list;
@@ -1317,15 +1354,36 @@ void BtcDescManager::candidate_selector(
           if ((descriptor.triangle_ - voxel_center).norm() < 1.5 * hash_resolution) {
             auto iter = data_base_.find(position);
             if (iter != data_base_.end()) {
+              total_hash_hits++;  // 统计：哈希表命中次数
               bool is_push_position = false;
               for (size_t j = 0; j < data_base_[position].size(); j++) {
-                if ((descriptor.frame_number_ -
-                     data_base_[position][j].frame_number_) >
+                int candidate_frame_id = data_base_[position][j].frame_number_;
+
+                // 预过滤1: 跳过邻近帧（帧号差值）
+                if ((descriptor.frame_number_ - candidate_frame_id) <=
                     config_setting_.skip_near_num_) {
-                  double dis =
-                      (descriptor.triangle_ - data_base_[position][j].triangle_)
-                          .norm();
-                  if (dis < dis_threshold) {
+                  total_skip_near++;  // 统计：跳过邻近帧
+                  continue;
+                }
+
+                // 预过滤2: 根据odom距离过滤（新增）
+                if (!frame_positions_.empty() && current_position.norm() > 0) {
+                  auto curr_pos_iter = frame_positions_.find(descriptor.frame_number_);
+                  auto cand_pos_iter = frame_positions_.find(candidate_frame_id);
+                  if (curr_pos_iter != frame_positions_.end() &&
+                      cand_pos_iter != frame_positions_.end()) {
+                    double odom_distance = (curr_pos_iter->second - cand_pos_iter->second).norm();
+                    if (odom_distance > max_loop_distance_) {
+                      continue;  // 跳过距离太远的候选帧
+                    }
+                  }
+                }
+
+                // BTC几何匹配
+                double dis =
+                    (descriptor.triangle_ - data_base_[position][j].triangle_)
+                        .norm();
+                if (dis < dis_threshold) {
                     double similarity =
                         (binary_similarity(descriptor.binary_A_,
                                            data_base_[position][j].binary_A_) +
@@ -1338,14 +1396,33 @@ void BtcDescManager::candidate_selector(
                       useful_match[i] = true;
                       useful_match_position[i].push_back(position);
                       useful_match_index[i].push_back(j);
+                    } else {
+                      total_sim_filter++;  // 统计：相似度过滤
                     }
+                  } else {
+                    total_dis_filter++;  // 统计：距离过滤
                   }
-                }
               }
             }
           }
         }
       });
+
+  // 打印统计信息（如果启用debug）
+  if (config_setting_.print_debug_info_) {
+    int num_useful = 0;
+    for (size_t i = 0; i < useful_match.size(); i++) {
+      if (useful_match[i]) num_useful++;
+    }
+    std::cout << "[candidate_selector] frame=" << current_frame_id
+              << ", btcs=" << current_STD_list.size()
+              << ", hash_hits=" << total_hash_hits
+              << ", skip_near=" << total_skip_near
+              << ", dis_filter=" << total_dis_filter
+              << ", sim_filter=" << total_sim_filter
+              << ", useful_match=" << num_useful << "/" << current_STD_list.size()
+              << std::endl;
+  }
   std::vector<Eigen::Vector2i, Eigen::aligned_allocator<Eigen::Vector2i>>
       index_recorder;
   for (size_t i = 0; i < useful_match.size(); i++) {
@@ -1397,7 +1474,7 @@ void BtcDescManager::candidate_selector(
       }
     }
     BTCMatchList match_triangle_list;
-    if (max_vote_index >= 0 && max_vote >= 5) {
+    if (max_vote_index >= 0 && max_vote >= config_setting_.candidate_selector_min_vote_) {
       match_votes[max_vote_index] = 0;  // 清零已选中的候选
       match_triangle_list.match_frame_ = max_vote_index;
       match_triangle_list.match_id_.first = current_frame_id;
@@ -1428,7 +1505,7 @@ void BtcDescManager::candidate_verify(
 
   // P2-3: 增加几何一致性过滤，减少ICP误收敛
   // 计算三角形边长方差和中心分布
-  if (candidate_matcher.match_list_.size() < 5) {
+  if (candidate_matcher.match_list_.size() < (size_t)config_setting_.candidate_verify_min_pairs_) {
     verify_score = -1;
     return;
   }
@@ -1463,12 +1540,12 @@ void BtcDescManager::candidate_verify(
   center_var /= candidate_matcher.match_list_.size();
   double center_std = sqrt(center_var);
 
-  // 几何一致性阈值（可配置）
-  double max_side_std_threshold = 3.0;   // 边长标准差阈值
-  double max_center_std_threshold = 10.0;  // 中心分布标准差阈值
+  // 几何一致性阈值（从配置文件读取）
+  double max_side_std_threshold = config_setting_.geom_side_std_threshold_;
+  double max_center_std_threshold = config_setting_.geom_center_std_threshold_;
 
   if (side_std > max_side_std_threshold || center_std > max_center_std_threshold) {
-    if (print_debug_info_) {
+    if (config_setting_.print_debug_info_) {
       std::cout << "[Verify] Geometric consistency check failed: "
                 << "side_std=" << side_std << " (threshold=" << max_side_std_threshold << "), "
                 << "center_std=" << center_std << " (threshold=" << max_center_std_threshold << ")"
@@ -1478,10 +1555,10 @@ void BtcDescManager::candidate_verify(
     return;
   }
 
-  double dis_threshold = 3;
+  double dis_threshold = config_setting_.ransac_correspondence_dis_;
   std::time_t solve_time = 0;
   std::time_t verify_time = 0;
-  int skip_len = (int)(candidate_matcher.match_list_.size() / 50) + 1;
+  int skip_len = (int)(candidate_matcher.match_list_.size() / config_setting_.ransac_sample_max_) + 1;
   int use_size = candidate_matcher.match_list_.size() / skip_len;
   std::vector<size_t> index(use_size);
   std::vector<int> vote_list(use_size);
@@ -1529,38 +1606,88 @@ void BtcDescManager::candidate_verify(
       max_vote = vote_list[i];
     }
   }
-  if (max_vote >= 4) {
+  
+  if (config_setting_.print_debug_info_) {
+    std::cout << "[Verify] RANSAC max_vote=" << max_vote 
+              << "/" << candidate_matcher.match_list_.size()
+              << " (threshold=" << config_setting_.ransac_min_vote_ << ")" << std::endl;
+  }
+  
+  if (max_vote >= config_setting_.ransac_min_vote_) {
     auto best_pair = candidate_matcher.match_list_[max_vote_index * skip_len];
-    int vote = 0;
     Eigen::Matrix3d best_rot;
     Eigen::Vector3d best_t;
+    // 初始位姿：单对求解
     triangle_solver(best_pair, best_t, best_rot);
+
+    if (config_setting_.print_debug_info_) {
+      std::cout << "[Verify] RANSAC init: t=" << best_t.norm() << "m" << std::endl;
+    }
+
+    // 迭代RANSAC: 用当前位姿找inlier → 用inlier重算位姿 → 反复直到收敛
+    int prev_inlier_count = 0;
+    const int max_iterations = config_setting_.ransac_max_iterations_;
+    for (int iter = 0; iter < max_iterations; iter++) {
+      std::vector<std::pair<BTC, BTC>> inlier_pairs;
+      for (size_t j = 0; j < candidate_matcher.match_list_.size(); j++) {
+        auto verify_pair = candidate_matcher.match_list_[j];
+        Eigen::Vector3d A = verify_pair.first.binary_A_.location_;
+        Eigen::Vector3d A_transform = best_rot * A + best_t;
+        Eigen::Vector3d B = verify_pair.first.binary_B_.location_;
+        Eigen::Vector3d B_transform = best_rot * B + best_t;
+        Eigen::Vector3d C = verify_pair.first.binary_C_.location_;
+        Eigen::Vector3d C_transform = best_rot * C + best_t;
+        double dis_A =
+            (A_transform - verify_pair.second.binary_A_.location_).norm();
+        double dis_B =
+            (B_transform - verify_pair.second.binary_B_.location_).norm();
+        double dis_C =
+            (C_transform - verify_pair.second.binary_C_.location_).norm();
+        if (dis_A < dis_threshold && dis_B < dis_threshold &&
+            dis_C < dis_threshold) {
+          inlier_pairs.push_back(verify_pair);
+        }
+      }
+
+      if (config_setting_.print_debug_info_) {
+        std::cout << "[Verify] RANSAC iter " << iter << ": inliers=" << inlier_pairs.size() << std::endl;
+      }
+
+      // 收敛判断
+      if ((int)inlier_pairs.size() == prev_inlier_count) {
+        if (config_setting_.print_debug_info_) {
+          std::cout << "[Verify] RANSAC converged at " << inlier_pairs.size() << " inliers" << std::endl;
+        }
+        break;
+      }
+      prev_inlier_count = inlier_pairs.size();
+
+      // 用inlier重算位姿（多对SVD优化）
+      if (inlier_pairs.size() > 1) {
+        triangle_solver_multi(inlier_pairs, best_t, best_rot);
+        if (config_setting_.print_debug_info_) {
+          std::cout << "[Verify] RANSAC iter " << iter << ": refined t=" << best_t.norm() << "m" << std::endl;
+        }
+      }
+      sucess_match_list = inlier_pairs;
+    }
+
     relative_pose.first = best_t;
     relative_pose.second = best_rot;
-    for (size_t j = 0; j < candidate_matcher.match_list_.size(); j++) {
-      auto verify_pair = candidate_matcher.match_list_[j];
-      Eigen::Vector3d A = verify_pair.first.binary_A_.location_;
-      Eigen::Vector3d A_transform = best_rot * A + best_t;
-      Eigen::Vector3d B = verify_pair.first.binary_B_.location_;
-      Eigen::Vector3d B_transform = best_rot * B + best_t;
-      Eigen::Vector3d C = verify_pair.first.binary_C_.location_;
-      Eigen::Vector3d C_transform = best_rot * C + best_t;
-      double dis_A =
-          (A_transform - verify_pair.second.binary_A_.location_).norm();
-      double dis_B =
-          (B_transform - verify_pair.second.binary_B_.location_).norm();
-      double dis_C =
-          (C_transform - verify_pair.second.binary_C_.location_).norm();
-      if (dis_A < dis_threshold && dis_B < dis_threshold &&
-          dis_C < dis_threshold) {
-        sucess_match_list.push_back(verify_pair);
-      }
-    }
     verify_score = plane_geometric_verify(
         plane_cloud_vec_.back(),
         plane_cloud_vec_[candidate_matcher.match_id_.second], relative_pose);
+    
+    if (config_setting_.print_debug_info_) {
+      std::cout << "[Verify] RANSAC success! match_pairs=" << sucess_match_list.size()
+                << ", final_t=" << best_t.norm() << "m"
+                << ", plane_verify_score=" << verify_score << std::endl;
+    }
   } else {
     verify_score = -1;
+    if (config_setting_.print_debug_info_) {
+      std::cout << "[Verify] RANSAC failed (max_vote=" << max_vote << " < " << config_setting_.ransac_min_vote_ << ")" << std::endl;
+    }
   }
   return;
 }
@@ -1587,6 +1714,60 @@ void BtcDescManager::triangle_solver(std::pair<BTC, BTC> &std_pair,
     rot = V * K * U.transpose();
   }
   t = -rot * std_pair.first.center_ + std_pair.second.center_;
+}
+
+void BtcDescManager::triangle_solver_multi(
+    const std::vector<std::pair<BTC, BTC>> &inlier_pairs,
+    Eigen::Vector3d &t, Eigen::Matrix3d &rot) {
+  if (inlier_pairs.empty()) return;
+
+  // 收集所有顶点对 (src -> ref)
+  // 每个BTC对提供3个顶点：A, B, C
+  // 减去各自重心做SVD
+  Eigen::MatrixXd src(3, inlier_pairs.size() * 3);
+  Eigen::MatrixXd ref(3, inlier_pairs.size() * 3);
+
+  int col = 0;
+  Eigen::Vector3d src_centroid = Eigen::Vector3d::Zero();
+  Eigen::Vector3d ref_centroid = Eigen::Vector3d::Zero();
+  int total_pts = 0;
+  for (const auto &pair : inlier_pairs) {
+    src_centroid += pair.first.binary_A_.location_;
+    src_centroid += pair.first.binary_B_.location_;
+    src_centroid += pair.first.binary_C_.location_;
+    ref_centroid += pair.second.binary_A_.location_;
+    ref_centroid += pair.second.binary_B_.location_;
+    ref_centroid += pair.second.binary_C_.location_;
+    total_pts += 3;
+  }
+  src_centroid /= total_pts;
+  ref_centroid /= total_pts;
+
+  col = 0;
+  for (const auto &pair : inlier_pairs) {
+    src.col(col) = pair.first.binary_A_.location_ - src_centroid;
+    ref.col(col) = pair.second.binary_A_.location_ - ref_centroid;
+    col++;
+    src.col(col) = pair.first.binary_B_.location_ - src_centroid;
+    ref.col(col) = pair.second.binary_B_.location_ - ref_centroid;
+    col++;
+    src.col(col) = pair.first.binary_C_.location_ - src_centroid;
+    ref.col(col) = pair.second.binary_C_.location_ - ref_centroid;
+    col++;
+  }
+
+  Eigen::Matrix3d covariance = src * ref.transpose();
+  Eigen::JacobiSVD<Eigen::MatrixXd> svd(
+      covariance, Eigen::ComputeThinU | Eigen::ComputeThinV);
+  Eigen::Matrix3d V = svd.matrixV();
+  Eigen::Matrix3d U = svd.matrixU();
+  rot = V * U.transpose();
+  if (rot.determinant() < 0) {
+    Eigen::Matrix3d K;
+    K << 1, 0, 0, 0, 1, 0, 0, 0, -1;
+    rot = V * K * U.transpose();
+  }
+  t = -rot * src_centroid + ref_centroid;
 }
 
 double BtcDescManager::plane_geometric_verify(

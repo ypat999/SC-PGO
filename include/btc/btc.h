@@ -23,16 +23,16 @@
 typedef struct ConfigSetting {
   // ========== 平面检测参数（通用适配默认值 - 优化版）==========
   double cloud_ds_size_ = 0.25;
-  
+
   float plane_detection_thre_ = 0.01;
   float voxel_size_ = 0.5;  // 降低以增加体素密度（原1.0导致体素内点数不足）
   int voxel_init_num_ = 3;  // 降低以适应稀疏点云（原5阈值过高）
-  
+
   // ========== 平面合并参数 ==========
   float plane_merge_normal_thre_ = 0.1;
   float plane_merge_dis_thre_ = 0.3;
   float plane_merge_search_radius_ = 2.0;  // P1-3: KDTree邻域搜索半径，替代全局O(N²)比较
-  
+
   // ========== 二进制描述子参数 ==========
   int proj_plane_num_ = 5;  // 增加多方向投影
   float proj_image_resolution_ = 0.5;
@@ -41,7 +41,7 @@ typedef struct ConfigSetting {
   float proj_dis_max_ = 5;
   float summary_min_thre_ = 3;  // 降低以适应单层扫描
   int line_filter_enable_ = 0;
-  
+
   // ========== BTC 生成参数 ==========
   float descriptor_near_num_ = 5;  // 降低允许较少描述子生成三角形
   float descriptor_min_len_ = 1;
@@ -49,14 +49,14 @@ typedef struct ConfigSetting {
   float non_max_suppression_radius_ = 3.0;
   float nms_score_margin_ = 1.0;  // P1-4: NMS score margin，避免大量descriptor被误删
   float std_side_resolution_ = 0.2;
-  
+
   int useful_corner_num_ = 20;  // 降低
-  
+
   // ========== 回环检测参数 ==========
   int skip_near_num_ = 5;  // 降低因静态场景帧间距离极小
   int candidate_num_ = 50;
   int sub_frame_num_ = 10;
-  
+
   // ========== 验证参数 ==========
   float rough_dis_threshold_ = 0.03;
   float similarity_threshold_ = 0.7;
@@ -65,11 +65,33 @@ typedef struct ConfigSetting {
   float dis_threshold_ = 0.3;
   int icp_min_match_num_ = 20;  // P2-2: ICP最小有效匹配数，避免退化优化
   float triangle_resolution_ = 0.2;
-  
+
+  // ========== 几何一致性验证阈值 ==========
+  // 三角形匹配的边长/中心分布标准差上限
+  // 稀疏点云场景（如Mid360）匹配散度大，需要放宽
+  float geom_side_std_threshold_ = 3.0;    // 边长标准差阈值 (m)
+  float geom_center_std_threshold_ = 10.0; // 中心分布标准差阈值 (m)
+
+  // ========== RANSAC 验证阈值 ==========
+  int ransac_min_vote_ = 4;  // RANSAC最小投票数，低于此值跳过平面几何验证
+  int ransac_max_iterations_ = 10;        // 迭代RANSAC最大轮数
+  int ransac_sample_max_ = 50;            // RANSAC采样最大点数（总匹配数/N=采样间隔）
+  double ransac_correspondence_dis_ = 3.0; // RANSAC角点对应距离阈值 (m)
+
+  // ========== 候选帧过滤阈值 ==========
+  int candidate_selector_min_vote_ = 5;    // candidate_selector: 最小投票数才创建候选
+  int candidate_verify_min_pairs_ = 5;     // candidate_verify: 最小匹配对数才验证
+
+  // ========== ICP 精化阈值 ==========
+  double icp_point_to_point_max_ = 3.0;    // Ceres ICP点对点距离上限 (m)
+
+  // ========== 调试开关 ==========
+  bool print_debug_info_ = false;  // 打印详细统计日志（hash_hits, useful_match等）
+
   // ========== 外参参数 ==========
   Eigen::Matrix3d rot_lidar_to_vehicle_;
   Eigen::Vector3d t_lidar_to_vehicle_;
-  
+
   int gt_file_style_ = 0;
 
 } ConfigSetting;
@@ -312,15 +334,26 @@ class BtcDescManager {
 
   std::vector<pcl::PointCloud<pcl::PointXYZINormal>::Ptr> plane_cloud_vec_;
 
+  // 新增：存储每帧的odom位置（用于预过滤候选帧）
+  std::unordered_map<int, Eigen::Vector3d> frame_positions_;
+
+  // 新增：最近一次SearchLoop的候选帧ID列表（用于Python诊断）
+  std::vector<int> last_candidate_ids_;
+
+  // 新增：最大回环距离阈值（从配置文件读取）
+  double max_loop_distance_ = 100.0;
+
   void GenerateBtcDescs(const pcl::PointCloud<pcl::PointXYZI>::Ptr &input_cloud,
                         const int frame_id, std::vector<BTC> &btcs_vec);
 
   void SearchLoop(const std::vector<BTC> &btcs_vec,
                   std::pair<int, double> &loop_result,
                   std::pair<Eigen::Vector3d, Eigen::Matrix3d> &loop_transform,
-                  std::vector<std::pair<BTC, BTC>> &loop_std_pair);
+                  std::vector<std::pair<BTC, BTC>> &loop_std_pair,
+                  const Eigen::Vector3d &current_position = Eigen::Vector3d(0, 0, 0));
 
-  void AddBtcDescs(const std::vector<BTC> &btcs_vec);
+  void AddBtcDescs(const std::vector<BTC> &btcs_vec,
+                   const Eigen::Vector3d &frame_position = Eigen::Vector3d(0, 0, 0));
 
   void PlaneGeomrtricIcp(
       const pcl::PointCloud<pcl::PointXYZINormal>::Ptr &source_cloud,
@@ -328,6 +361,10 @@ class BtcDescManager {
       std::pair<Eigen::Vector3d, Eigen::Matrix3d> &transform);
 
  private:
+  void candidate_selector(const std::vector<BTC> &current_STD_list,
+                          std::vector<BTCMatchList> &candidate_matcher_vec,
+                          const Eigen::Vector3d &current_position = Eigen::Vector3d(0, 0, 0));
+
   void init_voxel_map(const pcl::PointCloud<pcl::PointXYZI>::Ptr &input_cloud,
                       std::unordered_map<VOXEL_LOC, OctoTree *> &voxel_map);
 
@@ -357,9 +394,6 @@ class BtcDescManager {
   void generate_btc(const std::vector<BinaryDescriptor> &binary_list,
                     const int &frame_id, std::vector<BTC> &btc_list);
 
-  void candidate_selector(const std::vector<BTC> &btcs_vec,
-                          std::vector<BTCMatchList> &candidate_matcher_vec);
-
   void candidate_verify(
       const BTCMatchList &candidate_matcher, double &verify_score,
       std::pair<Eigen::Vector3d, Eigen::Matrix3d> &relative_pose,
@@ -367,6 +401,14 @@ class BtcDescManager {
 
   void triangle_solver(std::pair<BTC, BTC> &std_pair, Eigen::Vector3d &t,
                        Eigen::Matrix3d &rot);
+
+  /**
+   * 多对三角形SVD全局优化（迭代RANSAC用）
+   * 收集所有inlier对的3个顶点，做SVD求最优R,t
+   */
+  void triangle_solver_multi(
+      const std::vector<std::pair<BTC, BTC>> &inlier_pairs,
+      Eigen::Vector3d &t, Eigen::Matrix3d &rot);
 
   double plane_geometric_verify(
       const pcl::PointCloud<pcl::PointXYZINormal>::Ptr &source_cloud,
