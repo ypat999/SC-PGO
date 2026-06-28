@@ -15,6 +15,7 @@ find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(visualization_msgs REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
@@ -52,7 +53,7 @@ add_executable(alaserPGO
   src/gicp_registration.cpp
 )
 ament_target_dependencies(alaserPGO
-  rclcpp sensor_msgs geometry_msgs nav_msgs std_msgs tf2 tf2_ros
+  rclcpp sensor_msgs geometry_msgs nav_msgs std_msgs visualization_msgs tf2 tf2_ros
   cv_bridge pcl_conversions pcl_msgs ament_index_cpp ndt_omp_ros2
 )
 target_compile_options(alaserPGO PRIVATE ${OpenMP_CXX_FLAGS})

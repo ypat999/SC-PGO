@@ -15,6 +15,20 @@ import numpy as np
 from numpy import linalg as LA
 import yaml
 
+# ROS2 可选导入（用于离线脚本输出话题，供 RViz 比较 PGO 效果）
+HAS_ROS2 = False
+try:
+    import rclpy
+    from rclpy.node import Node
+    from nav_msgs.msg import Path as RosPath, Odometry as RosOdometry
+    from geometry_msgs.msg import PoseStamped as RosPoseStamped
+    from visualization_msgs.msg import Marker as RosMarker
+    from visualization_msgs.msg import MarkerArray as RosMarkerArray
+    from builtin_interfaces.msg import Duration as RosDuration
+    HAS_ROS2 = True
+except ImportError:
+    pass
+
 # pclomp GICP_OMP (与在线定位同款实现)
 try:
     import gicp_omp_cpp
@@ -522,7 +536,7 @@ class OfflineLoopCloser:
                  max_loop_distance=100.0, max_yaw_diff=None,
                  odom_direct_threshold=3.0, skip_near_num=5,
                  use_method='btc', sc_dist_thres=0.6, sc_max_radius=80.0,
-                 merge_n=1):
+                 merge_n=1, ros_node=None):
         """
         离线回环检测器 - 支持BTC和ScanContext两种方法
 
@@ -534,6 +548,8 @@ class OfflineLoopCloser:
             use_method: str, 默认'btc'。回环检测方法 ('btc' or 'sc')
             sc_dist_thres: float, 默认0.6。ScanContext距离阈值
             sc_max_radius: float, 默认80.0。ScanContext最大半径
+            ros_node: rclpy.Node 或 None，若提供则发布 odom_path / optimized_path / loop_match_markers
+                      话题用于 RViz 可视化比较 PGO 效果
         """
         self.data_dir = data_dir or "/home/ywj/save_data/"
         self.debug_btc = debug_btc
@@ -627,6 +643,29 @@ class OfflineLoopCloser:
         # 回环结果
         self.loop_pairs = []         # [(frame_a, frame_b, score, fitness), ...]
         self.loop_details = []       # 详细信息
+
+        # ===== ROS2 可视化（可选）=====
+        # 话题命名与在线 C++ 版本一致：odom_keyframe_path / optimized_path / loop_match_markers
+        self.ros_node = ros_node
+        self._ros_loop_marker_id = 0  # 递增的 marker id
+        self._ros_pub_odom_path = None
+        self._ros_pub_optimized_path = None
+        self._ros_pub_loop_markers = None
+        if ros_node is not None:
+            if not HAS_ROS2:
+                print("[WARN] rclpy 不可用，ros_node 参数将被忽略")
+                self.ros_node = None
+            else:
+                self._ros_pub_odom_path = ros_node.create_publisher(
+                    RosPath, 'odom_keyframe_path', 10)
+                self._ros_pub_optimized_path = ros_node.create_publisher(
+                    RosPath, 'optimized_path', 10)
+                # transient_local 让晚加入的订阅者也能收到所有已发布的回环标记
+                self._ros_pub_loop_markers = ros_node.create_publisher(
+                    RosMarkerArray, 'loop_match_markers',
+                    rclpy.qos.QoSProfile(depth=10,
+                                         durability=rclpy.qos.DurabilityPolicy.TRANSIENT_LOCAL))
+                print("[ROS2] 离线回环可视化已启用: odom_keyframe_path / optimized_path / loop_match_markers")
 
     def load_data(self, data_dir=None):
         """加载位姿和点云数据"""
@@ -766,6 +805,127 @@ class OfflineLoopCloser:
         self._save_poses_kitti(merged_poses_path, merged_poses)
         print(f"  保存合并位姿到: {merged_poses_path}")
 
+    # ======================== ROS2 可视化辅助方法 ========================
+
+    @staticmethod
+    def _matrix_to_pose_stamped(T, frame_id, stamp_ns=0):
+        """4x4 变换矩阵 → geometry_msgs/PoseStamped"""
+        roll, pitch, yaw = _extract_rpy(T)
+        t = T[:3, 3]
+        ps = RosPoseStamped()
+        ps.header.frame_id = frame_id
+        ps.header.stamp = RosDuration()  # zero stamp placeholder
+        # rclpy time 内部用 int64 nanoseconds，这里直接用 stamp_ns
+        ps.header.stamp.sec = int(stamp_ns // 1_000_000_000)
+        ps.header.stamp.nanosec = int(stamp_ns % 1_000_000_000)
+        ps.pose.position.x = float(t[0])
+        ps.pose.position.y = float(t[1])
+        ps.pose.position.z = float(t[2])
+        # RPY -> quaternion (xyzw)
+        cr, sr = np.cos(roll), np.sin(roll)
+        cp, sp = np.cos(pitch), np.sin(pitch)
+        cy, sy = np.cos(yaw), np.sin(yaw)
+        ps.pose.orientation.w = float(cr * cp * cy + sr * sp * sy)
+        ps.pose.orientation.x = float(sr * cp * cy - cr * sp * sy)
+        ps.pose.orientation.y = float(cr * sp * cy + sr * cp * sy)
+        ps.pose.orientation.z = float(cr * cp * sy - sr * sp * cy)
+        return ps
+
+    def _ros_publish_path(self, poses_list, publisher, frame_id='odom'):
+        """发布 nav_msgs/Path（一整条轨迹）"""
+        if self.ros_node is None or not HAS_ROS2 or publisher is None:
+            return
+        msg = RosPath()
+        msg.header.frame_id = frame_id
+        msg.header.stamp = self.ros_node.get_clock().now().to_msg()
+        for T in poses_list:
+            msg.poses.append(self._matrix_to_pose_stamped(T, frame_id))
+        publisher.publish(msg)
+
+    def _ros_publish_loop_markers(self, prev_idx, curr_idx, score,
+                                  pose_prev, pose_curr, frame_id='odom'):
+        """
+        发布一对回环匹配点 + 连线，与在线 C++ 版 publishLoopMatchMarkers 格式一致。
+
+        pose_prev, pose_curr: 4x4 numpy 矩阵
+        """
+        if self.ros_node is None or not HAS_ROS2:
+            return
+        now = self.ros_node.get_clock().now().to_msg()
+        marker_array = RosMarkerArray()
+        base_id = self._ros_loop_marker_id
+        self._ros_loop_marker_id += 4  # 4 markers per loop event
+
+        p_prev = pose_prev[:3, 3]
+        p_curr = pose_curr[:3, 3]
+
+        def _make_sphere(point, color_rgba, marker_id):
+            m = RosMarker()
+            m.header.frame_id = frame_id
+            m.header.stamp = now
+            m.ns = 'loop_match_points'
+            m.id = marker_id
+            m.type = RosMarker.SPHERE
+            m.action = RosMarker.ADD
+            m.pose.position.x = float(point[0])
+            m.pose.position.y = float(point[1])
+            m.pose.position.z = float(point[2])
+            m.pose.orientation.w = 1.0
+            m.scale.x = m.scale.y = m.scale.z = 0.6
+            m.color.r, m.color.g, m.color.b, m.color.a = color_rgba
+            # lifetime = 0 表示永久
+            m.lifetime = RosDuration()
+            return m
+
+        # Marker 1: prev keyframe point (red sphere)
+        marker_array.markers.append(
+            _make_sphere(p_prev, (1.0, 0.0, 0.0, 1.0), base_id))
+        # Marker 2: curr keyframe point (green sphere)
+        marker_array.markers.append(
+            _make_sphere(p_curr, (0.0, 1.0, 0.0, 1.0), base_id + 1))
+
+        # Marker 3: connecting line (yellow LINE_LIST with 2 points)
+        m_line = RosMarker()
+        m_line.header.frame_id = frame_id
+        m_line.header.stamp = now
+        m_line.ns = 'loop_match_lines'
+        m_line.id = base_id
+        m_line.type = RosMarker.LINE_LIST
+        m_line.action = RosMarker.ADD
+        m_line.scale.x = 0.05  # line width
+        m_line.color.r = 1.0
+        m_line.color.g = 1.0
+        m_line.color.b = 0.0
+        m_line.color.a = 1.0
+        m_line.pose.orientation.w = 1.0
+        from geometry_msgs.msg import Point as RosPoint
+        pt_prev = RosPoint(x=float(p_prev[0]), y=float(p_prev[1]), z=float(p_prev[2]))
+        pt_curr = RosPoint(x=float(p_curr[0]), y=float(p_curr[1]), z=float(p_curr[2]))
+        m_line.points = [pt_prev, pt_curr]
+        m_line.lifetime = RosDuration()
+        marker_array.markers.append(m_line)
+
+        # Marker 4: text label (loop pair indices + score)
+        m_text = RosMarker()
+        m_text.header.frame_id = frame_id
+        m_text.header.stamp = now
+        m_text.ns = 'loop_match_labels'
+        m_text.id = base_id
+        m_text.type = RosMarker.TEXT_VIEW_FACING
+        m_text.action = RosMarker.ADD
+        m_text.pose.position.x = float((p_prev[0] + p_curr[0]) * 0.5)
+        m_text.pose.position.y = float((p_prev[1] + p_curr[1]) * 0.5)
+        m_text.pose.position.z = float((p_prev[2] + p_curr[2]) * 0.5 + 1.0)
+        m_text.pose.orientation.w = 1.0
+        m_text.scale.z = 0.5
+        m_text.color.r = m_text.color.g = m_text.color.b = 1.0
+        m_text.color.a = 1.0
+        m_text.text = f'loop {prev_idx}<->{curr_idx} s={score:.3f}'
+        m_text.lifetime = RosDuration()
+        marker_array.markers.append(m_text)
+
+        self._ros_pub_loop_markers.publish(marker_array)
+
     def run(self):
         """执行完整的离线回环流程"""
         if not hasattr(self, 'all_poses'):
@@ -783,6 +943,9 @@ class OfflineLoopCloser:
         if len(self.keyframe_poses) < 20:
             print("[WARN] 关键帧数不足 20，无法进行回环检测")
             return
+
+        # 发布原始 odom 关键帧轨迹（PGO 输入），用于在 RViz 中与优化结果对比
+        self._ros_publish_path(self.keyframe_poses, self._ros_pub_odom_path)
 
         # ===== 步骤 2: BTC 描述子生成 + 数据库构建 =====
         print("\n===== 步骤 2: BTC 描述子生成 =====")
@@ -937,6 +1100,11 @@ class OfflineLoopCloser:
                                 t_vec[0], t_vec[1], t_vec[2],
                                 roll, pitch, yaw
                             ))
+                            # 发布回环匹配点 + 连线（odom_direct 路径，score 用 fitness 替代）
+                            self._ros_publish_loop_markers(
+                                candidate_id, i, gicp_result.fitness_score,
+                                self.keyframe_poses[candidate_id],
+                                self.keyframe_poses[i])
                             break  # 找到一个就跳出（避免重复验证）
 
             # ===== BTC匹配流程（正常流程） =====
@@ -1105,6 +1273,11 @@ class OfflineLoopCloser:
                         roll, pitch, yaw
                     ))
                     print(f"  [BTC Loop] 回环约束已添加: {prev_idx} <-> {curr_idx}")
+                    # 发布回环匹配点 + 连线（用关键帧原始 odom 位姿，与 odom_path 一致便于辨认位置）
+                    self._ros_publish_loop_markers(
+                        prev_idx, curr_idx, loop_score,
+                        self.keyframe_poses[prev_idx],
+                        self.keyframe_poses[curr_idx])
 
         print(f"\n  ----- Step 3 汇总 -----")
         print(f"  搜索帧数: {step3_search_count}")
@@ -1129,6 +1302,9 @@ class OfflineLoopCloser:
         # ===== 步骤 4: ISAM2 位姿图优化 (对应 C++ ISAM2) =====
         print("\n===== 步骤 4: ISAM2 位姿图优化 =====")
         optimized_poses = self._optimize_pose_graph(loop_constraints)
+
+        # 发布优化后的关键帧轨迹（PGO 输出），与 odom_keyframe_path 对照比较 PGO 效果
+        self._ros_publish_path(optimized_poses, self._ros_pub_optimized_path)
 
         # ===== 步骤 5: 保存结果 =====
         print("\n===== 步骤 5: 保存结果 =====")

@@ -101,12 +101,58 @@ def parse_args():
     parser.add_argument("--merge-n", type=int, default=1,
                         help="每N帧合并为一帧，提升点云密度 (默认: 1, 不合并)。Mid360推荐10")
 
+    # ROS2 可视化输出（用于在 RViz 中比较 PGO 效果）
+    parser.add_argument("--ros2", action="store_true",
+                        help="启用 ROS2 话题输出: odom_keyframe_path / optimized_path / loop_match_markers")
+    parser.add_argument("--ros2-node-name", type=str, default="offline_loop_closure",
+                        help="ROS2 节点名 (默认: offline_loop_closure)")
+    parser.add_argument("--ros2-keep-alive", action="store_true",
+                        help="处理完成后保持节点运行（便于在 RViz 中查看话题），按 Ctrl+C 退出")
+
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
 
+    # 可选初始化 ROS2 节点（用于发布 odom_path / optimized_path / loop_match_markers 话题）
+    ros_node = None
+    rclpy_initialized = False
+    if args.ros2:
+        try:
+            import rclpy
+            from rclpy.node import Node
+            rclpy.init()
+            ros_node = Node(args.ros2_node_name)
+            rclpy_initialized = True
+            print(f"[ROS2] 节点已启动: {args.ros2_node_name}")
+            print("[ROS2] 将发布话题:")
+            print("  - odom_keyframe_path  (nav_msgs/Path)            PGO 输入轨迹")
+            print("  - optimized_path      (nav_msgs/Path)            PGO 优化输出轨迹")
+            print("  - loop_match_markers  (visualization_msgs/MarkerArray)  回环匹配点+连线")
+        except ImportError:
+            print("[WARN] rclpy 不可用，--ros2 选项已忽略（请先 source ROS2 环境）")
+        except Exception as e:
+            print(f"[WARN] ROS2 初始化失败: {e}")
+
+    try:
+        ret = _run_offline_loop_closure(args, ros_node)
+    finally:
+        if rclpy_initialized:
+            if ros_node is not None and args.ros2_keep_alive:
+                print("\n[ROS2] 处理完成，保持节点运行。按 Ctrl+C 退出...")
+                try:
+                    rclpy.spin(ros_node)
+                except KeyboardInterrupt:
+                    pass
+            if ros_node is not None:
+                ros_node.destroy_node()
+            rclpy.shutdown()
+    return ret
+
+
+def _run_offline_loop_closure(args, ros_node):
+    """实际的离线回环检测流程，便于在 ROS2 初始化/清理的 try-finally 中调用"""
     # 检查C++ BTC模块
     if not HAS_CPP_BTC:
         print("[ERROR] C++ BTC模块未安装，请先编译btc_cpp模块")
@@ -169,7 +215,8 @@ def main():
         max_yaw_diff=max_yaw_diff,
         odom_direct_threshold=odom_direct_threshold,
         skip_near_num=skip_near_num,  # 新增
-        merge_n=args.merge_n
+        merge_n=args.merge_n,
+        ros_node=ros_node
     )
 
     # 打印BTC配置参数

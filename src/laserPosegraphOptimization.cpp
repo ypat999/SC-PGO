@@ -3,11 +3,13 @@
 #include <pcl/point_types.h>
 
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <mutex>
 #include <optional>
 #include <queue>
 #include <rclcpp/rclcpp.hpp>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -38,6 +40,7 @@
 #include <nav_msgs/msg/path.hpp>
 #include <sensor_msgs/msg/nav_sat_fix.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
 
 // #include <eigen3/Eigen/Dense>
 
@@ -133,10 +136,13 @@ double recentOptimizedY = 0.0;
 
 rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftPGO;
 rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPathAftPGO;
+rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubOdomPath;       // raw odom keyframe trajectory (for PGO comparison)
 rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubMapAftPGO;
 
 rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLoopScanLocal;
 rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLoopSubmapLocal;
+
+rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pubLoopMatchMarkers;  // loop match points + connecting line
 
 rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomRepubVerifier;
 
@@ -338,11 +344,15 @@ void pubPath(void) {
   // Publish odom and path
   nav_msgs::msg::Odometry odomAftPGO;
   nav_msgs::msg::Path pathAftPGO;
+  nav_msgs::msg::Path pathOdom;  // raw odom keyframe trajectory (before PGO)
   pathAftPGO.header.frame_id = frame_id_odom;
+  pathOdom.header.frame_id = frame_id_odom;
   mKF.lock();
   for (int node_idx = 0; node_idx < recentIdxUpdated; node_idx++) {
     const Pose6D &pose_est =
         keyframePosesUpdated.at(node_idx);  // Updated poses
+    const Pose6D &pose_odom =
+        keyframePoses.at(node_idx);  // Raw odom keyframe poses
 
     nav_msgs::msg::Odometry odomAftPGOthis;
     odomAftPGOthis.header.frame_id = frame_id_odom;
@@ -368,10 +378,27 @@ void pubPath(void) {
     pathAftPGO.header.stamp = odomAftPGOthis.header.stamp;
     pathAftPGO.header.frame_id = frame_id_odom;
     pathAftPGO.poses.push_back(poseStampAftPGO);
+
+    // raw odom path pose
+    geometry_msgs::msg::PoseStamped poseStampOdom;
+    poseStampOdom.header = odomAftPGOthis.header;
+    poseStampOdom.pose.position.x = pose_odom.x;
+    poseStampOdom.pose.position.y = pose_odom.y;
+    poseStampOdom.pose.position.z = pose_odom.z;
+    tf2::Quaternion q_odom;
+    q_odom.setRPY(pose_odom.roll, pose_odom.pitch, pose_odom.yaw);
+    poseStampOdom.pose.orientation.x = q_odom.x();
+    poseStampOdom.pose.orientation.y = q_odom.y();
+    poseStampOdom.pose.orientation.z = q_odom.z();
+    poseStampOdom.pose.orientation.w = q_odom.w();
+    pathOdom.header.stamp = odomAftPGOthis.header.stamp;
+    pathOdom.header.frame_id = frame_id_odom;
+    pathOdom.poses.push_back(poseStampOdom);
   }
   mKF.unlock();
   pubOdomAftPGO->publish(odomAftPGO);  // Last pose
-  pubPathAftPGO->publish(pathAftPGO);  // Poses
+  pubPathAftPGO->publish(pathAftPGO);  // Optimized poses
+  pubOdomPath->publish(pathOdom);      // Raw odom keyframe poses
 
   geometry_msgs::msg::TransformStamped transformStamped;
   transformStamped.header.stamp = odomAftPGO.header.stamp;
@@ -388,6 +415,108 @@ void pubPath(void) {
   }
   br->sendTransform(transformStamped);
 }  // pubPath
+
+// Publish loop match markers: two spheres (prev/curr keyframe positions) + a line connecting them.
+// Uses keyframePosesUpdated so the markers line up with the optimized path shown in RViz.
+void publishLoopMatchMarkers(int prev_idx, int curr_idx, double score) {
+  if (!pubLoopMatchMarkers) return;
+
+  mKF.lock();
+  if (prev_idx < 0 || prev_idx >= int(keyframePosesUpdated.size()) ||
+      curr_idx < 0 || curr_idx >= int(keyframePosesUpdated.size())) {
+    mKF.unlock();
+    return;
+  }
+  Pose6D p_prev = keyframePosesUpdated[prev_idx];
+  Pose6D p_curr = keyframePosesUpdated[curr_idx];
+  mKF.unlock();
+
+  visualization_msgs::msg::MarkerArray marker_array;
+  rclcpp::Time now = nh->now();
+
+  // Use a persistent namespace for all loop markers; id is unique per loop event
+  // (encoded as prev_idx * 100000 + curr_idx to avoid collisions).
+  int base_id = prev_idx * 100000 + curr_idx;
+
+  // Marker 1: prev keyframe point (red sphere)
+  visualization_msgs::msg::Marker m_prev;
+  m_prev.header.frame_id = frame_id_odom;
+  m_prev.header.stamp = now;
+  m_prev.ns = "loop_match_points";
+  m_prev.id = base_id;
+  m_prev.type = visualization_msgs::msg::Marker::SPHERE;
+  m_prev.action = visualization_msgs::msg::Marker::ADD;
+  m_prev.pose.position.x = p_prev.x;
+  m_prev.pose.position.y = p_prev.y;
+  m_prev.pose.position.z = p_prev.z;
+  m_prev.pose.orientation.w = 1.0;
+  m_prev.scale.x = m_prev.scale.y = m_prev.scale.z = 0.6;  // 60cm sphere
+  m_prev.color.r = 1.0f;
+  m_prev.color.g = 0.0f;
+  m_prev.color.b = 0.0f;
+  m_prev.color.a = 1.0f;
+  m_prev.lifetime = rclcpp::Duration(0, 0);  // persistent
+  marker_array.markers.push_back(m_prev);
+
+  // Marker 2: curr keyframe point (green sphere)
+  visualization_msgs::msg::Marker m_curr = m_prev;
+  m_curr.id = base_id + 1;
+  m_curr.pose.position.x = p_curr.x;
+  m_curr.pose.position.y = p_curr.y;
+  m_curr.pose.position.z = p_curr.z;
+  m_curr.color.r = 0.0f;
+  m_curr.color.g = 1.0f;
+  m_curr.color.b = 0.0f;
+  marker_array.markers.push_back(m_curr);
+
+  // Marker 3: connecting line (yellow LINE_LIST with 2 points)
+  visualization_msgs::msg::Marker m_line;
+  m_line.header.frame_id = frame_id_odom;
+  m_line.header.stamp = now;
+  m_line.ns = "loop_match_lines";
+  m_line.id = base_id;
+  m_line.type = visualization_msgs::msg::Marker::LINE_LIST;
+  m_line.action = visualization_msgs::msg::Marker::ADD;
+  m_line.scale.x = 0.05;  // line width 5cm
+  m_line.color.r = 1.0f;
+  m_line.color.g = 1.0f;
+  m_line.color.b = 0.0f;
+  m_line.color.a = 1.0f;
+  m_line.pose.orientation.w = 1.0;
+  geometry_msgs::msg::Point pt_prev, pt_curr;
+  pt_prev.x = p_prev.x; pt_prev.y = p_prev.y; pt_prev.z = p_prev.z;
+  pt_curr.x = p_curr.x; pt_curr.y = p_curr.y; pt_curr.z = p_curr.z;
+  m_line.points.push_back(pt_prev);
+  m_line.points.push_back(pt_curr);
+  m_line.lifetime = rclcpp::Duration(0, 0);
+  marker_array.markers.push_back(m_line);
+
+  // Marker 4 (optional): text label showing loop pair indices and score
+  visualization_msgs::msg::Marker m_text;
+  m_text.header.frame_id = frame_id_odom;
+  m_text.header.stamp = now;
+  m_text.ns = "loop_match_labels";
+  m_text.id = base_id;
+  m_text.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
+  m_text.action = visualization_msgs::msg::Marker::ADD;
+  m_text.pose.position.x = (p_prev.x + p_curr.x) * 0.5;
+  m_text.pose.position.y = (p_prev.y + p_curr.y) * 0.5;
+  m_text.pose.position.z = (p_prev.z + p_curr.z) * 0.5 + 1.0;
+  m_text.pose.orientation.w = 1.0;
+  m_text.scale.z = 0.5;  // text height
+  m_text.color.r = 1.0f;
+  m_text.color.g = 1.0f;
+  m_text.color.b = 1.0f;
+  m_text.color.a = 1.0f;
+  std::ostringstream oss;
+  oss << "loop " << prev_idx << "<->" << curr_idx << " s=" << std::fixed
+      << std::setprecision(3) << score;
+  m_text.text = oss.str();
+  m_text.lifetime = rclcpp::Duration(0, 0);
+  marker_array.markers.push_back(m_text);
+
+  pubLoopMatchMarkers->publish(marker_array);
+}
 
 void updatePoses(void) {
   mKF.lock();
@@ -915,6 +1044,8 @@ void performSCLoopClosure(void) {
             cout << "[Odom Direct] constraint added between " << j
                  << " and " << curr_frame_id << " (fitness="
                  << gicp_result.fitness_score << ")" << endl;
+            // publish loop match markers (two points + connecting line)
+            publishLoopMatchMarkers(j, curr_frame_id, gicp_result.fitness_score);
             return;  // 找到一个就返回，跳过BTC流程
           }
         } else {
@@ -995,6 +1126,8 @@ void performSCLoopClosure(void) {
       mtxPosegraph.unlock();
       cout << "[BTC Loop] constraint added between " << prev_node_idx
            << " and " << curr_node_idx << endl;
+      // publish loop match markers (two points + connecting line)
+      publishLoopMatchMarkers(prev_node_idx, curr_node_idx, loopScore);
     }
   }
 }  // performSCLoopClosure
@@ -1230,6 +1363,8 @@ int main(int argc, char **argv) {
       "repub_odom", rclcpp::QoS(100));
   pubPathAftPGO = nh->create_publisher<nav_msgs::msg::Path>("/aft_pgo_path",
                                                             rclcpp::QoS(100));
+  pubOdomPath = nh->create_publisher<nav_msgs::msg::Path>(
+      "odom_keyframe_path", rclcpp::QoS(100));  // raw odom keyframe trajectory
   pubMapAftPGO = nh->create_publisher<sensor_msgs::msg::PointCloud2>(
       "aft_pgo_map", rclcpp::QoS(100));
 
@@ -1237,6 +1372,9 @@ int main(int argc, char **argv) {
       "loop_scan_local", rclcpp::QoS(100));
   pubLoopSubmapLocal = nh->create_publisher<sensor_msgs::msg::PointCloud2>(
       "loop_submap_local", rclcpp::QoS(100));
+
+  pubLoopMatchMarkers = nh->create_publisher<visualization_msgs::msg::MarkerArray>(
+      "loop_match_markers", rclcpp::QoS(100).transient_local());  // latched so late subscribers see all loops
 
   std::thread posegraph_slam{process_pg};  // pose graph construction
   std::thread lc_detection{process_lcd};   // loop closure detection
