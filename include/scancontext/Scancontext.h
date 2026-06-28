@@ -12,19 +12,16 @@
 
 #include <Eigen/Dense>
 
-#include <opencv2/opencv.hpp>
-#include <opencv2/core/eigen.hpp>
-#include <opencv2/highgui/highgui.hpp>
-#include <cv_bridge/cv_bridge.h>
+// ScanContext完全移除OpenCV依赖（避免TBB冲突）
+// 使用Eigen代替OpenCV矩阵运算，不需要任何OpenCV功能
 
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <pcl/filters/voxel_grid.h>
-#include <pcl_conversions/pcl_conversions.h>
 
 #include "scancontext/nanoflann.hpp"
 #include "scancontext/KDTreeVectorOfVectorsAdaptor.h"
-#include "aloam_velodyne/tic_toc.h"
+#include "scancontext/tic_toc_stub.h"  // 最小化计时stub
 
 using namespace Eigen;
 using namespace nanoflann;

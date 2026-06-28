@@ -21,72 +21,70 @@
 #define MAX_N 10000000000
 
 typedef struct ConfigSetting {
-  // ========== 平面检测参数（通用适配默认值 - 优化版）==========
+  // ========== 平面检测参数（与 btc_config.yaml 同步）==========
   double cloud_ds_size_ = 0.25;
 
-  float plane_detection_thre_ = 0.01;
-  float voxel_size_ = 0.5;  // 降低以增加体素密度（原1.0导致体素内点数不足）
-  int voxel_init_num_ = 3;  // 降低以适应稀疏点云（原5阈值过高）
+  float plane_detection_thre_ = 0.03;
+  float voxel_size_ = 0.2;
+  int voxel_init_num_ = 1;
 
   // ========== 平面合并参数 ==========
-  float plane_merge_normal_thre_ = 0.1;
-  float plane_merge_dis_thre_ = 0.3;
-  float plane_merge_search_radius_ = 2.0;  // P1-3: KDTree邻域搜索半径，替代全局O(N²)比较
+  float plane_merge_normal_thre_ = 0.25;
+  float plane_merge_dis_thre_ = 0.8;
+  float plane_merge_search_radius_ = 2.0;
 
   // ========== 二进制描述子参数 ==========
-  int proj_plane_num_ = 5;  // 增加多方向投影
-  float proj_image_resolution_ = 0.5;
-  float proj_image_high_inc_ = 0.5;
+  int proj_plane_num_ = 5;
+  float proj_image_resolution_ = 0.8;
+  float proj_image_high_inc_ = 0.8;
   float proj_dis_min_ = 0;
-  float proj_dis_max_ = 5;
-  float summary_min_thre_ = 3;  // 降低以适应单层扫描
+  float proj_dis_max_ = 10;
+  float summary_min_thre_ = 3;
   int line_filter_enable_ = 0;
 
   // ========== BTC 生成参数 ==========
-  float descriptor_near_num_ = 5;  // 降低允许较少描述子生成三角形
-  float descriptor_min_len_ = 1;
-  float descriptor_max_len_ = 10;
-  float non_max_suppression_radius_ = 3.0;
-  float nms_score_margin_ = 1.0;  // P1-4: NMS score margin，避免大量descriptor被误删
+  float descriptor_near_num_ = 10;
+  float descriptor_min_len_ = 0.3;
+  float descriptor_max_len_ = 30;
+  float non_max_suppression_radius_ = 1.5;
+  float nms_score_margin_ = 1.0;
   float std_side_resolution_ = 0.2;
 
-  int useful_corner_num_ = 20;  // 降低
+  int useful_corner_num_ = 50;
 
   // ========== 回环检测参数 ==========
-  int skip_near_num_ = 5;  // 降低因静态场景帧间距离极小
+  int skip_near_num_ = 20;
   int candidate_num_ = 50;
   int sub_frame_num_ = 10;
 
   // ========== 验证参数 ==========
-  float rough_dis_threshold_ = 0.03;
-  float similarity_threshold_ = 0.7;
-  float icp_threshold_ = 0.5;
-  float normal_threshold_ = 0.1;
-  float dis_threshold_ = 0.3;
-  int icp_min_match_num_ = 20;  // P2-2: ICP最小有效匹配数，避免退化优化
-  float triangle_resolution_ = 0.2;
+  float rough_dis_threshold_ = 0.10;
+  float similarity_threshold_ = 0.1;
+  float icp_threshold_ = 0.01;
+  float normal_threshold_ = 0.3;
+  float dis_threshold_ = 1.0;
+  int icp_min_match_num_ = 20;
+  float triangle_resolution_ = 0.4;
 
   // ========== 几何一致性验证阈值 ==========
-  // 三角形匹配的边长/中心分布标准差上限
-  // 稀疏点云场景（如Mid360）匹配散度大，需要放宽
-  float geom_side_std_threshold_ = 3.0;    // 边长标准差阈值 (m)
-  float geom_center_std_threshold_ = 10.0; // 中心分布标准差阈值 (m)
+  float geom_side_std_threshold_ = 12.0;
+  float geom_center_std_threshold_ = 30.0;
 
   // ========== RANSAC 验证阈值 ==========
-  int ransac_min_vote_ = 4;  // RANSAC最小投票数，低于此值跳过平面几何验证
-  int ransac_max_iterations_ = 10;        // 迭代RANSAC最大轮数
-  int ransac_sample_max_ = 50;            // RANSAC采样最大点数（总匹配数/N=采样间隔）
-  double ransac_correspondence_dis_ = 3.0; // RANSAC角点对应距离阈值 (m)
+  int ransac_min_vote_ = 3;
+  int ransac_max_iterations_ = 10;
+  int ransac_sample_max_ = 50;
+  double ransac_correspondence_dis_ = 3.0;
 
   // ========== 候选帧过滤阈值 ==========
-  int candidate_selector_min_vote_ = 5;    // candidate_selector: 最小投票数才创建候选
-  int candidate_verify_min_pairs_ = 5;     // candidate_verify: 最小匹配对数才验证
+  int candidate_selector_min_vote_ = 5;
+  int candidate_verify_min_pairs_ = 5;
 
   // ========== ICP 精化阈值 ==========
-  double icp_point_to_point_max_ = 3.0;    // Ceres ICP点对点距离上限 (m)
+  double icp_point_to_point_max_ = 3.0;
 
   // ========== 调试开关 ==========
-  bool print_debug_info_ = false;  // 打印详细统计日志（hash_hits, useful_match等）
+  bool print_debug_info_ = false;
 
   // ========== 外参参数 ==========
   Eigen::Matrix3d rot_lidar_to_vehicle_;

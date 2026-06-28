@@ -75,7 +75,12 @@ public:
         load_config_setting(config_file_, manager_.config_setting_);
     }
 
-    // GenerateBtcDescs - 返回BTC数量和基本信息
+    // 新增：设置最大回环距离阈值
+    void SetMaxLoopDistance(double max_distance) {
+        manager_.max_loop_distance_ = max_distance;
+    }
+
+    // GenerateBtcDescs - 返回完整的BTC描述子数据（用于混合方案：C++生成，Python搜索）
     py::dict GenerateBtcDescs(py::array_t<float> cloud_array, int frame_id) {
         auto cloud = numpy_to_pcl(cloud_array);
         std::vector<BTC> btcs_vec;
@@ -85,31 +90,100 @@ public:
         result["num_btcs"] = btcs_vec.size();
         result["frame_id"] = frame_id;
 
-        // 返回BTC三角形信息（用于调试）
-        py::list triangles;
+        // 返回完整的BTC描述子数据（用于Python SearchLoop）
+        py::list btcs_data;
         for (const auto& btc : btcs_vec) {
-            py::dict tri;
-            tri["triangle"] = btc.triangle_;
-            tri["center"] = btc.center_;
-            tri["frame_number"] = btc.frame_number_;
-            triangles.append(tri);
+            py::dict btc_dict;
+
+            // 三角形信息
+            btc_dict["triangle"] = btc.triangle_;
+            btc_dict["center"] = btc.center_;
+            btc_dict["frame_number"] = btc.frame_number_;
+
+            // BinaryDescriptor A
+            py::dict bin_A;
+            bin_A["location"] = btc.binary_A_.location_;
+            bin_A["summary"] = (int)btc.binary_A_.summary_;
+            bin_A["normal"] = btc.binary_A_.normal_;
+            bin_A["plane_id"] = btc.binary_A_.plane_id_;
+            // occupy_array: std::vector<bool> → Python list of bool
+            py::list occupy_A;
+            for (bool b : btc.binary_A_.occupy_array_) {
+                occupy_A.append(b);
+            }
+            bin_A["occupy_array"] = occupy_A;
+            btc_dict["binary_A"] = bin_A;
+
+            // BinaryDescriptor B
+            py::dict bin_B;
+            bin_B["location"] = btc.binary_B_.location_;
+            bin_B["summary"] = (int)btc.binary_B_.summary_;
+            bin_B["normal"] = btc.binary_B_.normal_;
+            bin_B["plane_id"] = btc.binary_B_.plane_id_;
+            py::list occupy_B;
+            for (bool b : btc.binary_B_.occupy_array_) {
+                occupy_B.append(b);
+            }
+            bin_B["occupy_array"] = occupy_B;
+            btc_dict["binary_B"] = bin_B;
+
+            // BinaryDescriptor C
+            py::dict bin_C;
+            bin_C["location"] = btc.binary_C_.location_;
+            bin_C["summary"] = (int)btc.binary_C_.summary_;
+            bin_C["normal"] = btc.binary_C_.normal_;
+            bin_C["plane_id"] = btc.binary_C_.plane_id_;
+            py::list occupy_C;
+            for (bool b : btc.binary_C_.occupy_array_) {
+                occupy_C.append(b);
+            }
+            bin_C["occupy_array"] = occupy_C;
+            btc_dict["binary_C"] = bin_C;
+
+            btcs_data.append(btc_dict);
         }
-        result["triangles"] = triangles;
+        result["btcs_data"] = btcs_data;
+
+        // 返回平面点云数据（用于Python _plane_geometric_verify）
+        // plane_cloud_vec_ 是 pcl::PointCloud<pcl::PointXYZINormal>::Ptr
+        // 每个点包含: x,y,z (center) + normal_x,normal_y,normal_z (normal)
+        py::list plane_cloud_data;
+        for (const auto& cloud_ptr : manager_.plane_cloud_vec_) {
+            for (const auto& pt : cloud_ptr->points) {
+                py::dict plane_dict;
+                plane_dict["center"] = Eigen::Vector3d(pt.x, pt.y, pt.z);
+                plane_dict["normal"] = Eigen::Vector3d(pt.normal_x, pt.normal_y, pt.normal_z);
+                plane_cloud_data.append(plane_dict);
+            }
+        }
+        result["plane_cloud"] = plane_cloud_data;
 
         return result;
     }
 
-    // SearchLoop - 返回匹配结果
-    py::dict SearchLoop(py::array_t<float> cloud_array, int frame_id) {
+    // SearchLoop - 返回匹配结果（新增帧位置参数）
+    py::dict SearchLoop(py::array_t<float> cloud_array, int frame_id,
+                        py::array_t<double> position_array = py::array_t<double>(3)) {
         auto cloud = numpy_to_pcl(cloud_array);
         std::vector<BTC> btcs_vec;
         manager_.GenerateBtcDescs(cloud, frame_id, btcs_vec);
+
+        // 提取帧位置
+        Eigen::Vector3d current_position(0, 0, 0);
+        if (position_array.size() == 3) {
+            auto buf = position_array.request();
+            double* ptr = static_cast<double*>(buf.ptr);
+            current_position = Eigen::Vector3d(ptr[0], ptr[1], ptr[2]);
+        }
 
         std::pair<int, double> loop_result;
         std::pair<Eigen::Vector3d, Eigen::Matrix3d> loop_transform;
         std::vector<std::pair<BTC, BTC>> loop_std_pair;
 
-        manager_.SearchLoop(btcs_vec, loop_result, loop_transform, loop_std_pair);
+        manager_.SearchLoop(btcs_vec, loop_result, loop_transform, loop_std_pair, current_position);
+
+        // 获取候选帧ID列表（用于Python端诊断）
+        std::vector<int> candidate_frame_ids = manager_.last_candidate_ids_;
 
         py::dict result;
         result["match_frame_id"] = loop_result.first;
@@ -117,16 +191,27 @@ public:
         result["translation"] = loop_transform.first;
         result["rotation"] = loop_transform.second;
         result["num_matches"] = loop_std_pair.size();
+        result["candidate_frame_ids"] = candidate_frame_ids;
 
         return result;
     }
 
-    // AddBtcDescs - 添加描述子到数据库
-    void AddBtcDescs(py::array_t<float> cloud_array, int frame_id) {
+    // AddBtcDescs - 添加描述子到数据库（新增帧位置参数）
+    void AddBtcDescs(py::array_t<float> cloud_array, int frame_id,
+                     py::array_t<double> position_array = py::array_t<double>(3)) {
         auto cloud = numpy_to_pcl(cloud_array);
         std::vector<BTC> btcs_vec;
         manager_.GenerateBtcDescs(cloud, frame_id, btcs_vec);
-        manager_.AddBtcDescs(btcs_vec);
+
+        // 提取帧位置
+        Eigen::Vector3d frame_position(0, 0, 0);
+        if (position_array.size() == 3) {
+            auto buf = position_array.request();
+            double* ptr = static_cast<double*>(buf.ptr);
+            frame_position = Eigen::Vector3d(ptr[0], ptr[1], ptr[2]);
+        }
+
+        manager_.AddBtcDescs(btcs_vec, frame_position);
     }
 
     // 获取配置参数
@@ -154,7 +239,7 @@ public:
 
     // 开启/关闭C++侧详细调试日志（平面检测、合并率、描述子数等）
     void SetDebugInfo(bool enable) {
-        manager_.print_debug_info_ = enable;
+        manager_.config_setting_.print_debug_info_ = enable;  // ← 修复：设置config_setting_的debug开关
         std::cout << "[BTC] C++ debug info " << (enable ? "ENABLED" : "DISABLED") << std::endl;
     }
 };
@@ -171,10 +256,12 @@ PYBIND11_MODULE(btc_cpp, m) {
              py::arg("cloud"), py::arg("frame_id"))
         .def("SearchLoop", &PyBtcDescManager::SearchLoop,
              "Search for loop closure candidates",
-             py::arg("cloud"), py::arg("frame_id"))
+             py::arg("cloud"), py::arg("frame_id"),
+             py::arg("position") = py::array_t<double>(3))
         .def("AddBtcDescs", &PyBtcDescManager::AddBtcDescs,
              "Add BTC descriptors to database",
-             py::arg("cloud"), py::arg("frame_id"))
+             py::arg("cloud"), py::arg("frame_id"),
+             py::arg("position") = py::array_t<double>(3))
         .def("GetConfig", &PyBtcDescManager::GetConfig,
              "Get BTC configuration parameters")
         .def("GetDatabaseSize", &PyBtcDescManager::GetDatabaseSize,
@@ -183,7 +270,10 @@ PYBIND11_MODULE(btc_cpp, m) {
              "Get number of history keyframes")
         .def("SetDebugInfo", &PyBtcDescManager::SetDebugInfo,
              "Enable/disable detailed C++ debug logging",
-             py::arg("enable"));
+             py::arg("enable"))
+        .def("SetMaxLoopDistance", &PyBtcDescManager::SetMaxLoopDistance,
+             "Set maximum loop closure distance threshold (meters)",
+             py::arg("max_distance"));
 
     // 导出配置加载函数（修复：去掉const）
     m.def("load_config", [](std::string config_file) {
