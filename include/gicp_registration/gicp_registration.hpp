@@ -22,6 +22,7 @@ struct GICPConfig {
   int max_iterations = 100;
   double fitness_score_threshold = 0.5;
   int num_threads = 4;
+  double max_init_translation = 15.0;  // 初始平移超过此值跳过GICP
 };
 
 struct GICPResult {

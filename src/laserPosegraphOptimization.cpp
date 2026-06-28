@@ -154,6 +154,11 @@ std::string frame_id_aft_pgo;
 sc_pgo::GICPRegistration* gicp_registration;
 bool use_gicp_for_loop_closure = true;
 double gicp_fitness_score_threshold = 0.5;
+double gicp_max_init_translation = 15.0;
+
+// Loop closure validation
+double max_loop_distance = 100.0;
+double max_yaw_diff = M_PI * 0.75;
 
 std::string padZeros(int val, int num_digits = 6) {
   std::ostringstream out;
@@ -883,25 +888,32 @@ void performSCLoopClosure(void) {
 
     // Use GICP for refinement if enabled
     if (use_gicp_for_loop_closure) {
-      mKF.lock();
-      auto currCloud = keyframeLaserClouds[curr_node_idx];
-      auto prevCloud = keyframeLaserClouds[prev_node_idx];
-      mKF.unlock();
-
-      // GICP refinement using BTC result as initial guess
-      sc_pgo::GICPResult gicp_result = gicp_registration->align(
-        currCloud, prevCloud, relative_pose_matrix.cast<double>()
-      );
-
-      if (gicp_result.has_converged && 
-          gicp_result.fitness_score < gicp_fitness_score_threshold) {
-        // Use GICP refined pose
-        relative_pose = gtsam::Pose3(gicp_result.transformation.cast<double>());
-        cout << "[GICP] Refinement successful! Fitness score: " 
-             << gicp_result.fitness_score << endl;
+      // 检查初始平移是否过大（避免GICP崩溃）
+      double init_translation = relative_pose_matrix.block<3, 1>(0, 3).norm();
+      if (init_translation > gicp_max_init_translation) {
+        std::cout << "[GICP] Initial translation " << init_translation 
+                  << "m > " << gicp_max_init_translation << "m, skipping GICP refinement." << std::endl;
       } else {
-        cout << "[GICP] Refinement failed or score too high (" 
-             << gicp_result.fitness_score << "), using BTC result" << endl;
+        mKF.lock();
+        auto currCloud = keyframeLaserClouds[curr_node_idx];
+        auto prevCloud = keyframeLaserClouds[prev_node_idx];
+        mKF.unlock();
+
+        // GICP refinement using BTC result as initial guess
+        sc_pgo::GICPResult gicp_result = gicp_registration->align(
+          currCloud, prevCloud, relative_pose_matrix.cast<double>()
+        );
+
+        if (gicp_result.has_converged && 
+            gicp_result.fitness_score < gicp_fitness_score_threshold) {
+          // Use GICP refined pose
+          relative_pose = gtsam::Pose3(gicp_result.transformation.cast<double>());
+          cout << "[GICP] Refinement successful! Fitness score: " 
+               << gicp_result.fitness_score << endl;
+        } else {
+          cout << "[GICP] Refinement failed or score too high (" 
+               << gicp_result.fitness_score << "), using BTC result" << endl;
+        }
       }
     }
 
@@ -935,23 +947,21 @@ bool validateLoopClosure(int prev_idx, int curr_idx, gtsam::Pose3 relative_pose)
   gtsam::Pose3 pose_diff = pose_prev.between(pose_curr);
   
   double distance = pose_diff.translation().norm();
-  double max_loop_distance = 100.0;
   if (distance > max_loop_distance) {
     std::cout << "[Loop validation] Distance too large: " << distance 
               << " > " << max_loop_distance << ". Reject loop." << std::endl;
     return false;
   }
   
-  double yaw_diff = std::abs(pose_diff.rotation().yaw());
-  double max_yaw_diff = M_PI * 0.75;
-  if (yaw_diff > max_yaw_diff) {
-    std::cout << "[Loop validation] Yaw difference too large: " << yaw_diff 
+  double yaw_diff_val = std::abs(pose_diff.rotation().yaw());
+  if (yaw_diff_val > max_yaw_diff) {
+    std::cout << "[Loop validation] Yaw difference too large: " << yaw_diff_val 
               << " > " << max_yaw_diff << ". Reject loop." << std::endl;
     return false;
   }
   
   std::cout << "[Loop validation] Passed. Distance: " << distance 
-            << ", Yaw diff: " << yaw_diff << std::endl;
+            << ", Yaw diff: " << yaw_diff_val << std::endl;
   return true;
 }
 
@@ -1062,7 +1072,18 @@ int main(int argc, char **argv) {
   nh->declare_parameter<int>("gicp_num_threads", 4);
   gicp_config.num_threads = nh->get_parameter("gicp_num_threads").as_int();
 
+  nh->declare_parameter<double>("gicp_max_init_translation", 15.0);
+  gicp_config.max_init_translation = nh->get_parameter("gicp_max_init_translation").as_double();
+  gicp_max_init_translation = gicp_config.max_init_translation;
+
   gicp_registration = new sc_pgo::GICPRegistration(gicp_config);
+
+  // Loop closure validation parameters
+  nh->declare_parameter<double>("max_loop_distance", 100.0);
+  max_loop_distance = nh->get_parameter("max_loop_distance").as_double();
+
+  nh->declare_parameter<double>("max_yaw_diff", M_PI * 0.75);
+  max_yaw_diff = nh->get_parameter("max_yaw_diff").as_double();
 
   nh->declare_parameter<double>("keyframe_meter_gap", 2.0);
   keyframeMeterGap = nh->get_parameter("keyframe_meter_gap").as_double();
