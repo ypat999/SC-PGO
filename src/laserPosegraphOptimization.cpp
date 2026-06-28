@@ -160,6 +160,9 @@ double gicp_max_init_translation = 15.0;
 double max_loop_distance = 100.0;
 double max_yaw_diff = M_PI * 0.75;
 
+// Odom Direct verification
+double odom_direct_threshold = 3.0;  // odom距离<此值时跳过BTC直接GICP验证
+
 std::string padZeros(int val, int num_digits = 6) {
   std::ostringstream out;
   out << std::internal << std::setfill('0') << std::setw(num_digits) << val;
@@ -855,6 +858,74 @@ void performSCLoopClosure(void) {
     return;
 
   int curr_frame_id = keyframePoses.size() - 1;
+
+  // ===== Odom Direct 验证: odom距离<阈值时直接GICP，跳过BTC =====
+  if (use_gicp_for_loop_closure && odom_direct_threshold > 0) {
+    mKF.lock();
+    Pose6D curr_pose = keyframePoses[curr_frame_id];
+    auto curr_cloud = keyframeLaserClouds[curr_frame_id];
+    mKF.unlock();
+
+    int skip_near = btcManager.config_setting_.skip_near_num_;
+    for (int j = 0; j < curr_frame_id; j++) {
+      if ((curr_frame_id - j) <= skip_near) continue;  // 跳过邻近帧
+
+      mKF.lock();
+      Pose6D prev_pose = keyframePoses[j];
+      auto prev_cloud = keyframeLaserClouds[j];
+      mKF.unlock();
+
+      double dx = curr_pose.x - prev_pose.x;
+      double dy = curr_pose.y - prev_pose.y;
+      double dz = curr_pose.z - prev_pose.z;
+      double odom_dist = sqrt(dx*dx + dy*dy + dz*dz);
+
+      if (odom_dist < odom_direct_threshold) {
+        // 计算 odom 相对位姿初值
+        gtsam::Pose3 pose_prev_gtsam = Pose6DtoGTSAMPose3(prev_pose);
+        gtsam::Pose3 pose_curr_gtsam = Pose6DtoGTSAMPose3(curr_pose);
+        gtsam::Pose3 odom_relative = pose_prev_gtsam.between(pose_curr_gtsam);
+        Eigen::Matrix4d init_guess = odom_relative.matrix();
+
+        double init_t = init_guess.block<3, 1>(0, 3).norm();
+        if (init_t > gicp_max_init_translation) {
+          cout << "[Odom Direct] frame " << j << " odom_dist=" << odom_dist
+               << "m, but init_t=" << init_t << "m > " << gicp_max_init_translation
+               << "m, skip" << endl;
+          continue;
+        }
+
+        cout << "[Odom Direct] frame " << curr_frame_id << " <-> " << j
+             << " odom_dist=" << odom_dist << "m < " << odom_direct_threshold
+             << "m, trying GICP..." << endl;
+
+        sc_pgo::GICPResult gicp_result = gicp_registration->align(
+          curr_cloud, prev_cloud, init_guess
+        );
+
+        if (gicp_result.has_converged &&
+            gicp_result.fitness_score < gicp_fitness_score_threshold) {
+          gtsam::Pose3 relative_pose(gicp_result.transformation.cast<double>());
+
+          if (validateLoopClosure(j, curr_frame_id, relative_pose)) {
+            mtxPosegraph.lock();
+            gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(
+                j, curr_frame_id, relative_pose, robustLoopNoise));
+            mtxPosegraph.unlock();
+            cout << "[Odom Direct] constraint added between " << j
+                 << " and " << curr_frame_id << " (fitness="
+                 << gicp_result.fitness_score << ")" << endl;
+            return;  // 找到一个就返回，跳过BTC流程
+          }
+        } else {
+          cout << "[Odom Direct] GICP failed (fitness="
+               << gicp_result.fitness_score << "), continue searching" << endl;
+        }
+      }
+    }
+  }
+
+  // ===== BTC 回环检测（正常流程） =====
   std::vector<BTC> btcs_vec;
   pcl::PointCloud<pcl::PointXYZI>::Ptr btcCloud(new pcl::PointCloud<pcl::PointXYZI>);
 
@@ -1084,6 +1155,10 @@ int main(int argc, char **argv) {
 
   nh->declare_parameter<double>("max_yaw_diff", M_PI * 0.75);
   max_yaw_diff = nh->get_parameter("max_yaw_diff").as_double();
+
+  // Odom Direct verification parameter
+  nh->declare_parameter<double>("odom_direct_threshold", 3.0);
+  odom_direct_threshold = nh->get_parameter("odom_direct_threshold").as_double();
 
   nh->declare_parameter<double>("keyframe_meter_gap", 2.0);
   keyframeMeterGap = nh->get_parameter("keyframe_meter_gap").as_double();
