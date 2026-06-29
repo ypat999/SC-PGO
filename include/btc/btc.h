@@ -9,7 +9,7 @@
 #include <Eigen/Core>
 #include <Eigen/Dense>
 #include <Eigen/StdVector>
-#include <execution>
+
 #include <fstream>
 #include <mutex>
 #include <opencv2/opencv.hpp>

@@ -507,9 +507,10 @@ void BtcDescManager::init_voxel_map(
     i++;
     iter_list.push_back(iter);
   }
-  std::for_each(
-      std::execution::par_unseq, index.begin(), index.end(),
-      [&](const size_t &i) { iter_list[i]->second->init_octo_tree(); });
+  #pragma omp parallel for
+  for (size_t ii = 0; ii < index.size(); ii++) {
+    iter_list[index[ii]]->second->init_octo_tree();
+  }
 }
 
 void BtcDescManager::get_plane(
@@ -540,31 +541,33 @@ void BtcDescManager::get_project_plane(
   }
   for (size_t i = 0; i < origin_list.size(); i++) origin_list[i]->id_ = 0;
   int current_id = 1;
-  for (auto iter = origin_list.end() - 1; iter != origin_list.begin(); iter--) {
-    for (auto iter2 = origin_list.begin(); iter2 != iter; iter2++) {
-      Eigen::Vector3d normal_diff = (*iter)->normal_ - (*iter2)->normal_;
-      Eigen::Vector3d normal_add = (*iter)->normal_ + (*iter2)->normal_;
-      double dis1 =
-          fabs((*iter)->normal_(0) * (*iter2)->center_(0) +
-               (*iter)->normal_(1) * (*iter2)->center_(1) +
-               (*iter)->normal_(2) * (*iter2)->center_(2) + (*iter)->d_);
-      double dis2 =
-          fabs((*iter2)->normal_(0) * (*iter)->center_(0) +
-               (*iter2)->normal_(1) * (*iter)->center_(1) +
-               (*iter2)->normal_(2) * (*iter)->center_(2) + (*iter2)->d_);
-      if (normal_diff.norm() < config_setting_.plane_merge_normal_thre_ ||
-          normal_add.norm() < config_setting_.plane_merge_normal_thre_)
-        if (dis1 < config_setting_.plane_merge_dis_thre_ &&
-            dis2 < config_setting_.plane_merge_dis_thre_) {
-          if ((*iter)->id_ == 0 && (*iter2)->id_ == 0) {
-            (*iter)->id_ = current_id;
-            (*iter2)->id_ = current_id;
-            current_id++;
-          } else if ((*iter)->id_ == 0 && (*iter2)->id_ != 0)
-            (*iter)->id_ = (*iter2)->id_;
-          else if ((*iter)->id_ != 0 && (*iter2)->id_ == 0)
-            (*iter2)->id_ = (*iter)->id_;
-        }
+  if (!origin_list.empty()) {
+    for (auto iter = origin_list.end() - 1; iter != origin_list.begin(); iter--) {
+      for (auto iter2 = origin_list.begin(); iter2 != iter; iter2++) {
+        Eigen::Vector3d normal_diff = (*iter)->normal_ - (*iter2)->normal_;
+        Eigen::Vector3d normal_add = (*iter)->normal_ + (*iter2)->normal_;
+        double dis1 =
+            fabs((*iter)->normal_(0) * (*iter2)->center_(0) +
+                 (*iter)->normal_(1) * (*iter2)->center_(1) +
+                 (*iter)->normal_(2) * (*iter2)->center_(2) + (*iter)->d_);
+        double dis2 =
+            fabs((*iter2)->normal_(0) * (*iter)->center_(0) +
+                 (*iter2)->normal_(1) * (*iter)->center_(1) +
+                 (*iter2)->normal_(2) * (*iter)->center_(2) + (*iter2)->d_);
+        if (normal_diff.norm() < config_setting_.plane_merge_normal_thre_ ||
+            normal_add.norm() < config_setting_.plane_merge_normal_thre_)
+          if (dis1 < config_setting_.plane_merge_dis_thre_ &&
+              dis2 < config_setting_.plane_merge_dis_thre_) {
+            if ((*iter)->id_ == 0 && (*iter2)->id_ == 0) {
+              (*iter)->id_ = current_id;
+              (*iter2)->id_ = current_id;
+              current_id++;
+            } else if ((*iter)->id_ == 0 && (*iter2)->id_ != 0)
+              (*iter)->id_ = (*iter2)->id_;
+            else if ((*iter)->id_ != 0 && (*iter2)->id_ == 0)
+              (*iter2)->id_ = (*iter)->id_;
+          }
+      }
     }
   }
   std::vector<std::shared_ptr<Plane>> merge_list;
@@ -1333,10 +1336,10 @@ void BtcDescManager::candidate_selector(
   int pass_num = 0;
   // P1-1: 使用可配置hash分辨率
   double hash_resolution = config_setting_.std_side_resolution_;
-  std::for_each(
-      std::execution::par_unseq, index.begin(), index.end(),
-      [&](const size_t &i) {
-        BTC descriptor = current_STD_list[i];
+  #pragma omp parallel for
+  for (size_t ii = 0; ii < index.size(); ii++) {
+    const size_t &i = index[ii];
+    BTC descriptor = current_STD_list[i];
         BTC_LOC position;
         int best_index = 0;
         BTC_LOC best_position;
@@ -1405,8 +1408,8 @@ void BtcDescManager::candidate_selector(
               }
             }
           }
-        }
-      });
+      }
+  }
 
   // 打印统计信息（如果启用debug）
   if (config_setting_.print_debug_info_) {
@@ -1442,25 +1445,25 @@ void BtcDescManager::candidate_selector(
   }
   bool multi_thread_en = false;
   if (multi_thread_en) {
-    std::for_each(
-        std::execution::par_unseq, index.begin(), index.end(),
-        [&](const size_t &i) {
-          if (useful_match[i]) {
-            std::pair<BTC, BTC> single_match_pair;
-            single_match_pair.first = current_STD_list[i];
-            for (size_t j = 0; j < useful_match_index[i].size(); j++) {
-              single_match_pair.second = data_base_[useful_match_position[i][j]]
-                                                   [useful_match_index[i][j]];
-              mylock.lock();
-              // 修复数组越界：使用unordered_map累加投票
-              match_votes[single_match_pair.second.frame_number_]++;
-              match_list.push_back(single_match_pair);
-              match_list_index.push_back(
-                  single_match_pair.second.frame_number_);
-              mylock.unlock();
-            }
-          }
-        });
+    #pragma omp parallel for
+    for (size_t ii = 0; ii < index.size(); ii++) {
+      const size_t &i = index[ii];
+      if (useful_match[i]) {
+        std::pair<BTC, BTC> single_match_pair;
+        single_match_pair.first = current_STD_list[i];
+        for (size_t j = 0; j < useful_match_index[i].size(); j++) {
+          single_match_pair.second = data_base_[useful_match_position[i][j]]
+                                               [useful_match_index[i][j]];
+          mylock.lock();
+          // 修复数组越界：使用unordered_map累加投票
+          match_votes[single_match_pair.second.frame_number_]++;
+          match_list.push_back(single_match_pair);
+          match_list_index.push_back(
+              single_match_pair.second.frame_number_);
+          mylock.unlock();
+        }
+      }
+    }
   }
 
   for (int cnt = 0; cnt < config_setting_.candidate_num_; cnt++) {
@@ -1566,10 +1569,10 @@ void BtcDescManager::candidate_verify(
     index[i] = i;
   }
   std::mutex mylock;
-  std::for_each(
-      std::execution::par_unseq, index.begin(), index.end(),
-      [&](const size_t &i) {
-        auto single_pair = candidate_matcher.match_list_[i * skip_len];
+  #pragma omp parallel for
+  for (size_t ii = 0; ii < index.size(); ii++) {
+    const size_t &i = index[ii];
+    auto single_pair = candidate_matcher.match_list_[i * skip_len];
         int vote = 0;
         Eigen::Matrix3d test_rot;
         Eigen::Vector3d test_t;
@@ -1596,7 +1599,7 @@ void BtcDescManager::candidate_verify(
         mylock.lock();
         vote_list[i] = vote;
         mylock.unlock();
-      });
+  }
 
   int max_vote_index = 0;
   int max_vote = 0;

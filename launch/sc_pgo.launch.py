@@ -12,11 +12,11 @@ def generate_launch_description():
     rvizscpgo_arg = DeclareLaunchArgument(
         "rvizscpgo", default_value="true", description="Launch RViz for SC-PGO"
     )
-    namespace_arg = DeclareLaunchArgument(
-        "namespace", default_value="", description="Namespace for all nodes"
-    )
+    # namespace_arg = DeclareLaunchArgument(
+    #     "namespace", default_value="", description="Namespace for all nodes"
+    # )
 
-    namespace = LaunchConfiguration("namespace")
+    # namespace = LaunchConfiguration("namespace")
 
     alaserPGO_node = Node(
         package="sc_pgo_ros2",
@@ -65,13 +65,4 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration("rvizscpgo")),
     )
 
-    # Group nodes under namespace
-    namespaced_group = GroupAction(
-        actions=[
-            # PushRosNamespace(namespace),
-            alaserPGO_node,
-            # rviz_node,
-        ]
-    )
-
-    return LaunchDescription([rvizscpgo_arg, namespace_arg, namespaced_group])
+    return LaunchDescription([rvizscpgo_arg, alaserPGO_node])

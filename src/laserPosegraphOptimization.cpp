@@ -864,8 +864,17 @@ void process_pg() {
       std::vector<BTC> btcs_vec;
       pcl::PointCloud<pcl::PointXYZI>::Ptr btcCloud(new pcl::PointCloud<pcl::PointXYZI>);
       pcl::copyPointCloud(*thisKeyFrameDS, *btcCloud);
-      btcManager.GenerateBtcDescs(btcCloud, curr_frame_id, btcs_vec);
+      cout << "[BTC] Starting GenerateBtcDescs for frame " << curr_frame_id
+           << ", cloud points: " << btcCloud->size() << endl;
+      try {
+        btcManager.GenerateBtcDescs(btcCloud, curr_frame_id, btcs_vec);
+        cout << "[BTC] GenerateBtcDescs done, btcs count: " << btcs_vec.size() << endl;
+      } catch (const std::exception &e) {
+        std::cerr << "[BTC] GenerateBtcDescs exception: " << e.what() << std::endl;
+        throw;
+      }
       btcManager.AddBtcDescs(btcs_vec);
+      cout << "[BTC] AddBtcDescs done" << endl;
 
       laserCloudMapPGORedraw = true;
       mKF.unlock();
@@ -972,7 +981,7 @@ void process_pg() {
     std::chrono::milliseconds dura(2);
     std::this_thread::sleep_for(dura);
     
-    if (frame_counter % 1000 == 0) {
+    if (frame_counter > 0 && frame_counter % 1000 == 0) {
       cout << "Process PG still running... Total frames processed: " << frame_counter << endl;
       cout << "Odometry buffer size: " << odometryBuf.size() << endl;
       cout << "FullRes buffer size: " << fullResBuf.size() << endl;
@@ -1254,6 +1263,17 @@ int main(int argc, char **argv) {
 
   nh->declare_parameter<std::string>("frame_id_aft_pgo", "aft_pgo");
   frame_id_aft_pgo = nh->get_parameter("frame_id_aft_pgo").as_string();
+
+  // prepend namespace to frame_ids if not already present
+  std::string ns = nh->get_namespace();
+  if (ns != "/" && ns != "") {
+    if (frame_id_odom.find("/") == std::string::npos) {
+      frame_id_odom = ns + "/" + frame_id_odom;
+    }
+    if (frame_id_aft_pgo.find("/") == std::string::npos) {
+      frame_id_aft_pgo = ns + "/" + frame_id_aft_pgo;
+    }
+  }
 
   // GICP parameters
   nh->declare_parameter<bool>("use_gicp_for_loop_closure", true);
