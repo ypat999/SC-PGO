@@ -25,6 +25,7 @@ try:
     from visualization_msgs.msg import Marker as RosMarker
     from visualization_msgs.msg import MarkerArray as RosMarkerArray
     from builtin_interfaces.msg import Duration as RosDuration
+    from builtin_interfaces.msg import Time as RosTime
     HAS_ROS2 = True
 except ImportError:
     pass
@@ -80,21 +81,22 @@ class GICPConfig:
     """对应 C++ GICPConfig，默认值适配 Mid360 回环场景"""
 
     def __init__(self):
-        self.transformation_epsilon = 1e-8       # 收敛精度（变换增量阈值）
-        self.max_correspondence_distance = 2.0   # 最大对应点距离 (m)，回环初始误差大时不宜太大
+        # 所有默认值与 btc_config.yaml 中 gicp 部分一致
+        self.transformation_epsilon = 0.001        # 收敛精度（变换增量阈值）
+        self.max_correspondence_distance = 5.0     # 最大对应点距离 (m)
         self.rotation_epsilon = 0.002
         self.k_correspondences = 20
         self.max_optimizer_iterations = 20
-        self.gicp_epsilon = 0.001                # GICP 协方差正则化（防奇异）
-        self.max_iterations = 100                 # 每级最大迭代次数
-        self.fitness_score_threshold = 0.15        # PCL原生fitness(1m)，优秀匹配<0.01
+        self.gicp_epsilon = 0.00001                # GICP 协方差正则化（防奇异）
+        self.max_iterations = 64                   # 每级最大迭代次数
+        self.fitness_score_threshold = 0.25        # GICP fitness 阈值
         self.num_threads = 4
+        self.scan_ds_size = 0.1                    # GICP配准前点云下采样体素 (m)
         # 多级配准参数
-        self.coarse_ds_size = 0.3                 # 粗配准下采样体素
-        self.coarse_max_iter = 50                 # 粗配准最大迭代
-        self.coarse_max_dist = 3.0                # 粗配准最大对应距离
-        # 新增：GICP初始平移阈值
-        self.max_init_translation = 15.0          # 初始平移超过此值时跳过验证
+        self.coarse_ds_size = 0.25                 # 粗配准下采样体素
+        self.coarse_max_iter = 50                  # 粗配准最大迭代
+        self.coarse_max_dist = 10.0                # 粗配准最大对应距离
+        self.max_init_translation = 15.0           # 初始平移超过此值时跳过验证
 
 
 class GICPResult:
@@ -474,26 +476,21 @@ def load_unified_config(config_file):
     result = {}
     result['btc_config_path'] = config_file
 
-    # GICP 部分
+    # GICP 部分 — 从 YAML 读取所有参数，fallback 使用 GICPConfig 默认值（单一数据源）
     gicp_cfg = GICPConfig()
     g = data.get('gicp', {})
-    gicp_cfg.fitness_score_threshold = g.get('fitness_score_threshold', 0.3)
-    gicp_cfg.max_correspondence_distance = g.get('max_correspondence_distance', 2.0)
-    gicp_cfg.max_iterations = g.get('max_iterations', 100)
-    gicp_cfg.transformation_epsilon = g.get('transformation_epsilon', 1e-8)
-    gicp_cfg.gicp_epsilon = g.get('gicp_epsilon', 0.001)
-    gicp_cfg.scan_ds_size = g.get('scan_ds_size', 0.1)
-    # 粗配准参数
-    gicp_cfg.coarse_ds_size = g.get('coarse_ds_size', 0.3)
-    gicp_cfg.coarse_max_iter = g.get('coarse_max_iter', 50)
-    gicp_cfg.coarse_max_dist = g.get('coarse_max_dist', 3.0)
-    # 新增：GICP初始平移阈值
-    gicp_cfg.max_init_translation = g.get('max_init_translation', 15.0)  # 从yaml读取
+    for attr_name in ['fitness_score_threshold', 'max_correspondence_distance',
+                      'max_iterations', 'transformation_epsilon', 'gicp_epsilon',
+                      'scan_ds_size', 'coarse_ds_size', 'coarse_max_iter',
+                      'coarse_max_dist', 'max_init_translation',
+                      'rotation_epsilon', 'k_correspondences',
+                      'max_optimizer_iterations', 'num_threads']:
+        if attr_name in g:
+            setattr(gicp_cfg, attr_name, g[attr_name])
     result['gicp_config'] = gicp_cfg
 
-    # BTC部分 - 新增读取skip_near_num
-    btc_cfg = data.get('btc', {})
-    result['skip_near_num'] = btc_cfg.get('skip_near_num', 5)  # 从配置文件读取
+    # skip_near_num - 顶层键（在YAML中属于BTC检索部分，非嵌套）
+    result['skip_near_num'] = data.get('skip_near_num', 5)  # 从配置文件读取
 
     # ScanContext部分 - 新增
     sc_cfg = data.get('scancontext', {})
@@ -509,7 +506,7 @@ def load_unified_config(config_file):
 
     # 回环验证部分
     lv = data.get('loop_validation', {})
-    result['max_loop_distance'] = lv.get('max_distance', 100.0)
+    result['max_loop_distance'] = lv.get('max_loop_distance', 100.0)
     result['max_yaw_diff'] = lv.get('max_yaw_diff', np.pi * 0.75)
     result['odom_direct_threshold'] = lv.get('odom_direct_threshold', 3.0)
 
@@ -590,21 +587,6 @@ class OfflineLoopCloser:
             self.sc_cpp = None
             if use_method == 'sc':
                 print("[ScanContext] ⚠ C++ 模块未安装，无法使用ScanContext方法")
-            if btc_config_file and os.path.exists(btc_config_file):
-                self.btc_cpp = btc_cpp.BtcDescManager(btc_config_file)
-                print(f"[BTC] 使用C++实现 (加载配置): {btc_config_file}")
-            else:
-                self.btc_cpp = btc_cpp.BtcDescManager()
-                print("[BTC] 使用C++实现 (内置默认配置)")
-
-            # 启用C++ debug日志
-            if self.debug_btc and hasattr(self.btc_cpp, 'SetDebugInfo'):
-                self.btc_cpp.SetDebugInfo(True)
-
-            # 设置最大回环距离阈值（用于预过滤候选帧）
-            if hasattr(self.btc_cpp, 'SetMaxLoopDistance'):
-                self.btc_cpp.SetMaxLoopDistance(max_loop_distance)
-                print(f"[BTC] 最大回环距离阈值: {max_loop_distance}m")
 
         self.btc_manager = self.btc_cpp  # 统一接口
         self.btc_config = None  # Python不再需要BTC配置对象
@@ -619,6 +601,9 @@ class OfflineLoopCloser:
 
         # GICP 配置
         self.gicp_config = gicp_config or GICPConfig()
+        print(f"[GICP] 配置: fitness_thres={self.gicp_config.fitness_score_threshold:.2f}, "
+              f"max_dist={self.gicp_config.max_correspondence_distance:.1f}, "
+              f"max_iter={self.gicp_config.max_iterations}")
         self.use_gicp = use_gicp
 
         # 关键帧参数
@@ -814,7 +799,7 @@ class OfflineLoopCloser:
         t = T[:3, 3]
         ps = RosPoseStamped()
         ps.header.frame_id = frame_id
-        ps.header.stamp = RosDuration()  # zero stamp placeholder
+        ps.header.stamp = RosTime()  # zero stamp placeholder
         # rclpy time 内部用 int64 nanoseconds，这里直接用 stamp_ns
         ps.header.stamp.sec = int(stamp_ns // 1_000_000_000)
         ps.header.stamp.nanosec = int(stamp_ns % 1_000_000_000)
@@ -937,6 +922,8 @@ class OfflineLoopCloser:
 
         # ===== 步骤 1: 关键帧选择 (对应 C++ process_pg 中的关键帧判断) =====
         print("\n===== 步骤 1: 关键帧选择 =====")
+        print(f"  参数: meter_gap={self.keyframe_meter_gap:.1f}m, "
+              f"deg_gap={self.keyframe_deg_gap:.1f}°")
         self._select_keyframes()
         print(f"  关键帧数: {len(self.keyframe_poses)} / {len(self.all_poses)}")
 

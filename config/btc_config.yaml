@@ -125,20 +125,20 @@ line_filter_enable: 0
 #   - 每个角点只与最近的 descriptor_near_num 个角点组成三角形
 #   - 小值 (5): 三角形少 → 快但可能漏回环
 #   - 大值 (10): 三角形多 → 回环召回高但慢
-descriptor_near_num: 10  # 提高到10，生成更多BTC描述子增加召回率
+descriptor_near_num: 30  # 提高到10，生成更多BTC描述子增加召回率
 
 # descriptor_min_len / descriptor_max_len: 三角形边长范围 (m)
 #   - 边长在 [min_len, max_len] 内的三角形才保留
 #   - 太小三角形 (< 0.3m): 不稳定（噪声敏感）
 #   - 太大三角形 (> 30m): 跨越场景区域，误匹配率高
 descriptor_min_len: 0.3
-descriptor_max_len: 30
+descriptor_max_len: 20
 
 # useful_corner_num: 有效角点数量阈值
 #   - 保留 score 最高的 useful_corner_num 个角点
 #   - 小值 (20): 角点少 → 三角形少 → 快
 #   - 大值 (50): 角点多 → 三角形多 → 回环召回高
-useful_corner_num: 50  # 增加角点数量，生成更多BTC描述子
+useful_corner_num: 20  # 增加角点数量，生成更多BTC描述子
 
 # non_max_suppression_radius: NMS半径 (m)
 #   - 在此半径内只保留 score 最高的角点（去除重复角点）
@@ -156,13 +156,13 @@ non_max_suppression_radius: 1.5
 #   - 避免：相邻帧（真实运动很小）被误认为回环
 #   - 小值 (2): 允许短距离回环（室内小场景）
 #   - 大值 (10): 只允许长距离回环（室外大场景）
-skip_near_num: 20  # 降低到默认值，适应小规模关键帧集（65帧）
+skip_near_num: 30  # 降低到默认值，适应小规模关键帧集（65帧）
 
 # candidate_num: 候选帧数量阈值
 #   - 候选帧投票数 > candidate_num 才进入验证阶段
-#   - 小值 (10): 候选少 → 快但可能漏回环
-#   - 大值 (50): 候选多 → 回环召回高但验证慢
-candidate_num: 50  # 降低阈值，适应小规模关键帧集
+#   - 小值 (10): 候选多 → 回环召回高但验证慢
+#   - 大值 (50): 候选少 → 快但可能漏回环
+candidate_num: 3  # 降低阈值，适应小规模关键帧集
 
 # rough_dis_threshold: 粗匹配距离阈值（相对值）
 #   - 两BTC三角形边长差 < rough_dis_threshold * 边长 才算匹配
@@ -174,13 +174,13 @@ rough_dis_threshold: 0.10
 #   - 两二进制描述子Jaccard相似度 > similarity_threshold 才算匹配
 #   - 小值 (0.3): 宽松 → 候选多（但误匹配多）
 #   - 大值 (0.5): 严格 → 候选少但准确
-similarity_threshold: 0.1  # 降低到0.2，增加匹配几率（首尾帧匹配场景）
+similarity_threshold: 0.2  # 降低到0.2，增加匹配几率（首尾帧匹配场景）
 
 # icp_threshold: ICP/BTC验证分数阈值
 #   - 平面几何验证分数 > icp_threshold 才接受回环
 #   - 分数 = 匹配平面点数 / 总平面点数
-#   - 小值 (0.10): 严格 → 回环少但准确
-#   - 大值 (0.30): 宽松 → 回环多（但有误检）
+#   - 小值 (0.05): 宽松 → 回环多但可能有误检
+#   - 大值 (0.30): 严格 → 回环少但准确
 #   - ⚠️ Mid360点云稀疏导致平面检测质量差，验证分数通常0.04-0.05
 #   - ⚠️ 原值0.15太高导致所有候选被过滤，降低到0.03适应稀疏雷达
 #   - 策略：进一步降到0.01，让更多候选通过C++层面，交给GICP最终把关
@@ -210,8 +210,8 @@ geom_center_std_threshold: 30.0
 # ransac_min_vote: RANSAC最小投票数
 #   - BTC匹配对经RANSAC验证，投票数 < ransac_min_vote 则跳过平面几何验证
 #   - 原硬编码4，改为可配置
-#   - 小值 (4): 严格 → 要求较多角点一致
 #   - 小值 (2): 宽松 → 允许较少角点一致（稀疏场景）
+#   - 大值 (4): 严格 → 要求较多角点一致
 #   - 策略：降到3，让GICP最终把关
 ransac_min_vote: 3
 
@@ -260,10 +260,10 @@ icp_point_to_point_max: 3.0
 # 回环候选 → 验证几何合理性 → 接受/拒绝
 
 loop_validation:
-  # max_distance: 最大回环距离 (m)
-  #   - 两关键帧 odom 位置差 < max_distance 才可能是回环
+  # max_loop_distance: 最大回环距离 (m)
+  #   - 两关键帧 odom 位置差 < max_loop_distance 才可能是回环
   #   - 用于过滤明显错误的BTC匹配
-  max_distance: 10.0
+  max_loop_distance: 10.0
 
   # odom_direct_threshold: Odom直接验证阈值 (m)
   #   - 两关键帧 odom 位置差 < odom_direct_threshold 时，跳过BTC直接GICP验证
@@ -271,7 +271,14 @@ loop_validation:
   #   - 小值 (2.0): 只对极近距离帧直接验证（减少误检）
   #   - 大值 (5.0): 对较近距离帧直接验证（提高召回率）
   #   - ⚠️ 配合 skip_near_num 使用，避免邻近帧误检
-  odom_direct_threshold: 0.1
+  odom_direct_threshold: 1.0
+
+  max_yaw_diff: 6.28  # 最大偏航角差 (rad)
+  #   - 两关键帧 odom 偏航角差 < max_yaw_diff 才可能是回环
+  #   - 用于过滤明显错误的BTC匹配
+  #   - 小值 (0.75π): 只对极近距离帧直接验证（减少误检）
+  #   - 大值 (1.5π): 对较近距离帧直接验证（提高召回率）
+  #   - ⚠️ 配合 skip_near_num 使用，避免邻近帧误检
 
 # ================================================================================
 # 第六阶段：平面几何验证（Plane Geometric Verification）
@@ -280,8 +287,8 @@ loop_validation:
 
 # normal_threshold: 法向量夹角阈值 (cos值)
 #   - 变换后两平面点法向量夹角 < arccos(threshold) 才算匹配
-#   - 大值 (0.5 ≈ 60°): 宽松
-#   - 小值 (0.2 ≈ 78°): 严格
+#   - 小值 (0.2 ≈ 78°): 宽松 → 允许更大夹角偏差
+#   - 大值 (0.5 ≈ 60°): 严格 → 只允许小夹角偏差
 normal_threshold: 0.3
 
 # dis_threshold: 点到平面距离阈值 (m)
@@ -321,11 +328,11 @@ gicp:
   #   - GICP匹配时，两点距离 < 此阈值才算对应点
   #   - 小值 (2.0): 严格 → 匹配点少但精确
   #   - 大值 (5.0): 宽松 → 匹配点多（适合初值误差大）
-  max_correspondence_distance: 5.0
+  max_correspondence_distance: 10.0
 
   # max_iterations: 精配准最大迭代次数
   #   - 迭代次数上限，防止不收敛时无限循环
-  max_iterations: 100
+  max_iterations: 64
 
   # transformation_epsilon: 收敛精度（变换增量阈值）
   #   - 变换增量 < 此阈值时停止迭代（收敛）
@@ -351,7 +358,7 @@ gicp:
   #   - 小值 (10.0): 严格限制初始平移（适合场景小、回环初值准）
   #   - 大值 (20.0): 放宽限制（适合场景大、回环初值不准）
   #   - ⚠️ 此阈值应用于Odom Direct和BTC Loop两种流程
-  max_init_translation: 15.0
+  max_init_translation: 10.0
 
   # coarse_ds_size: 粗配准下采样体素 (m)
   #   - 粗配准阶段用更粗下采样，加快收敛
@@ -371,10 +378,10 @@ keyframe:
   #   - 两帧位置差 > meter_gap 才选为关键帧
   #   - 小值 (1.0): 关键帧多 → 回环召回高但慢
   #   - 大值 (5.0): 关键帧少 → 快但可能漏回环
-  meter_gap: 1.0
+  meter_gap: 5.0
 
   # deg_gap: 关键帧角度间隔 (deg)
   #   - 两帧角度差 > deg_gap 才选为关键帧
   #   - 避免：原地旋转时关键帧过多
-  deg_gap: 10.0
+  deg_gap: 30.0
 

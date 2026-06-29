@@ -18,7 +18,7 @@ Super-LIO 离线回环检测工具 (BTC + GICP)
   - loop_pairs.txt       : 检测到的回环对
 
 用法：
-  python3 offline_loop_closure.py --btc-config config/btc_config.yaml --merge-n 10 --debug-btc
+  python3 offline_loop_closure.py --btc-config ../../config/btc_config.yaml --merge-n 10 --debug-btc
 """
 
 import os
@@ -35,18 +35,13 @@ ROS2_INSTALL_DIR = "/home/ywj/dog_slam/LIO-SAM_MID360_ROS2_PKG/ros2/install/sc_p
 if os.path.exists(ROS2_INSTALL_DIR) and ROS2_INSTALL_DIR not in sys.path:
     sys.path.insert(0, ROS2_INSTALL_DIR)
 
-# 尝试加载C++ BTC模块
-try:
-    import btc_cpp
-    HAS_CPP_BTC = True
-    print("[INFO] C++ BTC模块已加载: btc_cpp")
-except ImportError:
-    HAS_CPP_BTC = False
-    print("[WARN] C++ BTC模块未安装，请先编译btc_cpp模块")
+# 注意: btc_cpp 的导入移到 _run_offline_loop_closure 内部，
+# 避免 C++ 扩展共享库与 rclpy 冲突导致 Node() 创建时 SIGABRT。
 
 from loop_closure_common import (
     OfflineLoopCloser,
     GICPConfig,
+    HAS_BTC_CPP,
     load_unified_config,
 )
 
@@ -153,15 +148,28 @@ def main():
 
 def _run_offline_loop_closure(args, ros_node):
     """实际的离线回环检测流程，便于在 ROS2 初始化/清理的 try-finally 中调用"""
-    # 检查C++ BTC模块
-    if not HAS_CPP_BTC:
+    # 检查C++ BTC模块（由 loop_closure_common 管理导入，其导入顺序为 rclpy→btc_cpp）
+    if not HAS_BTC_CPP:
         print("[ERROR] C++ BTC模块未安装，请先编译btc_cpp模块")
         print("[ERROR] 解决方案: 见 BTC_CPP_BINDING_BUILD.md")
         return 1
 
     # 从统一配置文件加载参数（CLI 可覆盖）
-    if args.btc_config and os.path.exists(args.btc_config):
-        cfg = load_unified_config(args.btc_config)
+    btc_config_path = args.btc_config
+    if btc_config_path and not os.path.exists(btc_config_path):
+        # 尝试相对于 SCRIPT_DIR 解析（方便从不同目录运行）
+        alt = os.path.join(SCRIPT_DIR, btc_config_path)
+        if os.path.exists(alt):
+            btc_config_path = alt
+        elif not os.path.isabs(btc_config_path):
+            # 尝试在包根目录查找 (config/ 在 src/SC_PGO_ROS2/ 下)
+            pkg_root = os.path.dirname(SCRIPT_DIR)  # utils/python → ..
+            alt2 = os.path.join(pkg_root, btc_config_path)
+            if os.path.exists(alt2):
+                btc_config_path = alt2
+
+    if btc_config_path and os.path.exists(btc_config_path):
+        cfg = load_unified_config(btc_config_path)
         btc_config_file = cfg['btc_config_path']
         gicp_config = cfg['gicp_config']
         use_gicp = cfg['use_gicp']
@@ -197,6 +205,8 @@ def _run_offline_loop_closure(args, ros_node):
     if args.max_yaw_diff is not None:
         max_yaw_diff = args.max_yaw_diff
     # CLI 覆盖回环验证参数
+    if args.max_loop_distance != 100.0:
+        max_loop_distance = args.max_loop_distance
     if args.odom_direct_threshold != 3.0:
         odom_direct_threshold = args.odom_direct_threshold
     if hasattr(args, 'skip_near_num') and args.skip_near_num is not None:
@@ -205,7 +215,8 @@ def _run_offline_loop_closure(args, ros_node):
     # 创建离线回环检测器（只使用C++ BTC）
     closer = OfflineLoopCloser(
         data_dir=args.data_dir,
-        btc_config_file=args.btc_config,
+        btc_config_file=btc_config_path,  # 使用解析后的路径
+        gicp_config=gicp_config,
         keyframe_meter_gap=keyframe_meter_gap,
         keyframe_deg_gap=keyframe_deg_gap,
         use_gicp=not args.no_gicp,
@@ -234,7 +245,13 @@ def _run_offline_loop_closure(args, ros_node):
         return 1
 
     # 执行回环检测 + 优化
-    optimized_poses = closer.run()
+    try:
+        optimized_poses = closer.run()
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        print("\n[ERROR] closer.run() 发生异常，跳过优化结果输出")
+        return 1
 
     if optimized_poses is not None:
         print(f"\n[DONE] 优化完成, {len(optimized_poses)} 个关键帧位姿")
