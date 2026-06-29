@@ -136,6 +136,7 @@ double recentOptimizedY = 0.0;
 
 rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftPGO;
 rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPathAftPGO;
+rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubOptimizedPath;  // PGO optimized path (same as pubPathAftPGO, different topic name)
 rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubOdomPath;       // raw odom keyframe trajectory (for PGO comparison)
 rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubMapAftPGO;
 
@@ -159,7 +160,7 @@ std::string frame_id_aft_pgo;
 // GICP registration
 sc_pgo::GICPRegistration* gicp_registration;
 bool use_gicp_for_loop_closure = true;
-double gicp_fitness_score_threshold = 0.5;
+double gicp_fitness_score_threshold = 0.25;
 double gicp_max_init_translation = 15.0;
 
 // Loop closure validation
@@ -398,6 +399,7 @@ void pubPath(void) {
   mKF.unlock();
   pubOdomAftPGO->publish(odomAftPGO);  // Last pose
   pubPathAftPGO->publish(pathAftPGO);  // Optimized poses
+  pubOptimizedPath->publish(pathAftPGO); // Same optimized path on "optimized_path" topic
   pubOdomPath->publish(pathOdom);      // Raw odom keyframe poses
 
   geometry_msgs::msg::TransformStamped transformStamped;
@@ -1279,18 +1281,18 @@ int main(int argc, char **argv) {
   nh->declare_parameter<bool>("use_gicp_for_loop_closure", true);
   use_gicp_for_loop_closure = nh->get_parameter("use_gicp_for_loop_closure").as_bool();
 
-  nh->declare_parameter<double>("gicp_fitness_score_threshold", 0.5);
+  nh->declare_parameter<double>("gicp_fitness_score_threshold", 0.25);
   gicp_fitness_score_threshold = nh->get_parameter("gicp_fitness_score_threshold").as_double();
 
   // Initialize GICP registration
   sc_pgo::GICPConfig gicp_config;
-  nh->declare_parameter<double>("gicp_transformation_epsilon", 1e-6);
+  nh->declare_parameter<double>("gicp_transformation_epsilon", 0.001);
   gicp_config.transformation_epsilon = nh->get_parameter("gicp_transformation_epsilon").as_double();
 
-  nh->declare_parameter<double>("gicp_max_correspondence_distance", 30.0);
+  nh->declare_parameter<double>("gicp_max_correspondence_distance", 5.0);
   gicp_config.max_correspondence_distance = nh->get_parameter("gicp_max_correspondence_distance").as_double();
 
-  nh->declare_parameter<int>("gicp_max_iterations", 100);
+  nh->declare_parameter<int>("gicp_max_iterations", 64);
   gicp_config.max_iterations = nh->get_parameter("gicp_max_iterations").as_int();
 
   nh->declare_parameter<int>("gicp_num_threads", 4);
@@ -1299,6 +1301,19 @@ int main(int argc, char **argv) {
   nh->declare_parameter<double>("gicp_max_init_translation", 15.0);
   gicp_config.max_init_translation = nh->get_parameter("gicp_max_init_translation").as_double();
   gicp_max_init_translation = gicp_config.max_init_translation;
+
+  // Two-stage alignment parameters
+  nh->declare_parameter<double>("gicp_scan_ds_size", 0.1);
+  gicp_config.scan_ds_size = nh->get_parameter("gicp_scan_ds_size").as_double();
+
+  nh->declare_parameter<double>("gicp_coarse_ds_size", 0.25);
+  gicp_config.coarse_ds_size = nh->get_parameter("gicp_coarse_ds_size").as_double();
+
+  nh->declare_parameter<int>("gicp_coarse_max_iter", 50);
+  gicp_config.coarse_max_iter = nh->get_parameter("gicp_coarse_max_iter").as_int();
+
+  nh->declare_parameter<double>("gicp_coarse_max_dist", 10.0);
+  gicp_config.coarse_max_dist = nh->get_parameter("gicp_coarse_max_dist").as_double();
 
   gicp_registration = new sc_pgo::GICPRegistration(gicp_config);
 
@@ -1383,6 +1398,8 @@ int main(int argc, char **argv) {
       "repub_odom", rclcpp::QoS(100));
   pubPathAftPGO = nh->create_publisher<nav_msgs::msg::Path>("/aft_pgo_path",
                                                             rclcpp::QoS(100));
+  pubOptimizedPath = nh->create_publisher<nav_msgs::msg::Path>(
+      "optimized_path", rclcpp::QoS(100));  // PGO optimized path
   pubOdomPath = nh->create_publisher<nav_msgs::msg::Path>(
       "odom_keyframe_path", rclcpp::QoS(100));  // raw odom keyframe trajectory
   pubMapAftPGO = nh->create_publisher<sensor_msgs::msg::PointCloud2>(

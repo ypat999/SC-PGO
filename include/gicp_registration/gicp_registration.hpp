@@ -13,16 +13,21 @@ namespace sc_pgo {
 typedef pcl::PointXYZI PointType;
 
 struct GICPConfig {
-  double transformation_epsilon = 1e-6;
-  double max_correspondence_distance = 30.0;
+  double transformation_epsilon = 0.001;
+  double max_correspondence_distance = 5.0;
   double rotation_epsilon = 0.002;
   int k_correspondences = 20;
   int max_optimizer_iterations = 20;
-  double gicp_epsilon = 0.01;
-  int max_iterations = 100;
-  double fitness_score_threshold = 0.5;
+  double gicp_epsilon = 0.00001;
+  int max_iterations = 64;
+  double fitness_score_threshold = 0.25;
   int num_threads = 4;
   double max_init_translation = 15.0;  // 初始平移超过此值跳过GICP
+  // Two-stage alignment parameters
+  double scan_ds_size = 0.1;           // GICP前点云下采样体素 (m)
+  double coarse_ds_size = 0.25;       // 粗配准下采样体素 (m)
+  int coarse_max_iter = 50;            // 粗配准最大迭代
+  double coarse_max_dist = 10.0;      // 粗配准最大对应距离 (m)
 };
 
 struct GICPResult {
