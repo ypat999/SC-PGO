@@ -5,8 +5,22 @@
 #include <pcl/point_types.h>
 #include <pcl/point_cloud.h>
 #include <iostream>
+#include <algorithm>
 
 namespace sc_pgo {
+
+// 移除NaN/Inf点，避免KDTree崩溃
+static void removeInvalidPoints(typename pcl::PointCloud<PointType>::Ptr cloud) {
+  size_t orig = cloud->size();
+  cloud->erase(std::remove_if(cloud->begin(), cloud->end(),
+    [](const PointType& p) {
+      return !std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z);
+    }), cloud->end());
+  if (orig != cloud->size()) {
+    std::cout << "[GICP] Removed " << (orig - cloud->size())
+              << " invalid points (NaN/Inf)" << std::endl;
+  }
+}
 
 GICPRegistration::GICPRegistration() {
   initializeGICP();
@@ -53,17 +67,31 @@ GICPResult GICPRegistration::align(
     return result;
   }
 
+  // Stage 0: Ensure input clouds are clean
+  pcl::PointCloud<PointType>::Ptr src_clean(new pcl::PointCloud<PointType>(*source_cloud));
+  pcl::PointCloud<PointType>::Ptr tgt_clean(new pcl::PointCloud<PointType>(*target_cloud));
+  removeInvalidPoints(src_clean);
+  removeInvalidPoints(tgt_clean);
+
+  if (src_clean->empty() || tgt_clean->empty()) {
+    std::cout << "[GICP] All input points invalid" << std::endl;
+    return result;
+  }
+
   // ===== Stage 1: Coarse alignment (downsampled) =====
   pcl::PointCloud<PointType>::Ptr src_ds(new pcl::PointCloud<PointType>);
   pcl::PointCloud<PointType>::Ptr tgt_ds(new pcl::PointCloud<PointType>);
   {
     pcl::VoxelGrid<PointType> voxel;
     voxel.setLeafSize(config_.coarse_ds_size, config_.coarse_ds_size, config_.coarse_ds_size);
-    voxel.setInputCloud(source_cloud);
+    voxel.setInputCloud(src_clean);
     voxel.filter(*src_ds);
-    voxel.setInputCloud(target_cloud);
+    voxel.setInputCloud(tgt_clean);
     voxel.filter(*tgt_ds);
   }
+  // VoxelGrid can produce NaN centroids — remove them
+  removeInvalidPoints(src_ds);
+  removeInvalidPoints(tgt_ds);
 
   std::cout << "[GICP] Coarse: " << src_ds->size() << " vs " << tgt_ds->size()
             << " pts (ds=" << config_.coarse_ds_size << "m)" << std::endl;
@@ -100,8 +128,8 @@ GICPResult GICPRegistration::align(
   fine_gicp->setMaximumOptimizerIterations(config_.max_optimizer_iterations);
   fine_gicp->setGICPEpsilon(config_.gicp_epsilon);
   fine_gicp->setMaximumIterations(config_.max_iterations);
-  fine_gicp->setInputSource(source_cloud);
-  fine_gicp->setInputTarget(target_cloud);
+  fine_gicp->setInputSource(src_clean);
+  fine_gicp->setInputTarget(tgt_clean);
 
   pcl::PointCloud<PointType>::Ptr fine_aligned(new pcl::PointCloud<PointType>);
   fine_gicp->align(*fine_aligned, T_coarse);

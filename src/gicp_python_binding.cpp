@@ -16,14 +16,51 @@
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <pcl/filters/voxel_grid.h>
-#include <pcl/kdtree/kdtree_flann.h>
+#include <pcl/search/kdtree.h>
 #include <pclomp/gicp_omp.h>
 #include <pclomp/gicp_omp_impl.hpp>
 #include <pcl/registration/exceptions.h>
 #include <omp.h>
 #include <stdexcept>
+#include <algorithm>
+#include <cmath>
 
 namespace py = pybind11;
+
+// ==================== NaN安全的KdTree搜索类 ====================
+// 继承 pcl::search::KdTree，重写 nearestKSearch 和 radiusSearch 虚函数，
+// 在调用原始实现前检查查询点是否包含 NaN/Inf，避免 KDTree assertion 崩溃。
+// 通过 setSearchMethodTarget/Source 注入到 GICP 中。
+class NaNCheckedKdTree : public pcl::search::KdTree<pcl::PointXYZI> {
+public:
+    using Base = pcl::search::KdTree<pcl::PointXYZI>;
+    using Ptr = std::shared_ptr<NaNCheckedKdTree>;
+
+    NaNCheckedKdTree(bool sorted = true) : Base(sorted) {}
+
+    int nearestKSearch(const pcl::PointXYZI& point, int k,
+                       pcl::Indices& k_indices,
+                       std::vector<float>& k_sqr_distances) const override {
+        if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z)) {
+            k_indices.clear();
+            k_sqr_distances.clear();
+            return 0;
+        }
+        return Base::nearestKSearch(point, k, k_indices, k_sqr_distances);
+    }
+
+    int radiusSearch(const pcl::PointXYZI& point, double radius,
+                     pcl::Indices& k_indices,
+                     std::vector<float>& k_sqr_distances,
+                     unsigned int max_nn = 0) const override {
+        if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z)) {
+            k_indices.clear();
+            k_sqr_distances.clear();
+            return 0;
+        }
+        return Base::radiusSearch(point, radius, k_indices, k_sqr_distances, max_nn);
+    }
+};
 
 // ==================== 辅助函数: NumPy数组转PCL点云 ====================
 pcl::PointCloud<pcl::PointXYZI>::Ptr numpy_to_pcl(py::array_t<float> array) {
@@ -46,6 +83,19 @@ pcl::PointCloud<pcl::PointXYZI>::Ptr numpy_to_pcl(py::array_t<float> array) {
         cloud->push_back(pt);
     }
     return cloud;
+}
+
+// ==================== 辅助函数: 移除NaN/Inf点 ====================
+static pcl::PointCloud<pcl::PointXYZI>::Ptr removeInvalidPoints(
+    const pcl::PointCloud<pcl::PointXYZI>::ConstPtr& cloud) {
+    auto clean = pcl::PointCloud<pcl::PointXYZI>::Ptr(new pcl::PointCloud<pcl::PointXYZI>);
+    clean->reserve(cloud->size());
+    for (const auto& p : cloud->points) {
+        if (std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z)) {
+            clean->push_back(p);
+        }
+    }
+    return clean;
 }
 
 // ==================== GICP_OMP Python 包装类 ====================
@@ -139,14 +189,11 @@ public:
             }
         }
 
-        // 打印简洁信息（单行）
         double init_t = initial_guess.block<3,1>(0,3).norm();
         std::cout << "[GICP_OMP] src=" << source_cloud->size()
                   << ", tgt=" << target_cloud->size()
-                  << ", init_t=" << init_t << "m"
-                  << std::endl;
+                  << ", init_t=" << init_t << "m" << std::endl;
 
-        // 执行配准
         gicp_->setInputSource(source_cloud);
         gicp_->setInputTarget(target_cloud);
 
@@ -162,14 +209,11 @@ public:
             return result;
         }
 
-        // 获取结果
         Eigen::Matrix4f final_T = gicp_->getFinalTransformation();
         bool converged = gicp_->hasConverged();
         double fitness = gicp_->getFitnessScore();
 
         Eigen::Matrix4d T_double = final_T.cast<double>();
-
-        // 打印
         double final_disp = T_double.block<3,1>(0,3).norm();
         std::cout << "[GICP_OMP] converged=" << (converged ? "true" : "false")
                   << ", fitness(overlap)=" << fitness
@@ -179,7 +223,6 @@ public:
         result["transformation"] = T_double;
         result["has_converged"] = converged;
         result["fitness_score"] = fitness;
-
         return result;
     }
 
@@ -190,6 +233,19 @@ public:
                            int fine_max_iter, double fine_max_dist) {
         auto source_cloud = numpy_to_pcl(source_array);
         auto target_cloud = numpy_to_pcl(target_array);
+
+        // 移除NaN/Inf点
+        source_cloud = removeInvalidPoints(source_cloud);
+        target_cloud = removeInvalidPoints(target_cloud);
+
+        if (source_cloud->empty() || target_cloud->empty()) {
+            std::cout << "[GICP_OMP] All input points invalid, skip" << std::endl;
+            py::dict result;
+            result["transformation"] = Eigen::Matrix4d::Identity();
+            result["has_converged"] = false;
+            result["fitness_score"] = 1e9;
+            return result;
+        }
 
         // 解析初始猜测
         Eigen::Matrix4f initial_guess = Eigen::Matrix4f::Identity();
@@ -206,25 +262,12 @@ public:
         double init_t = initial_guess.block<3,1>(0,3).norm();
         std::cout << "[GICP_OMP] src=" << source_cloud->size()
                   << ", tgt=" << target_cloud->size()
-                  << ", init_t=" << init_t << "m"
-                  << std::endl;
+                  << ", init_t=" << init_t << "m" << std::endl;
 
-        // 检查初始猜测矩阵是否有效（避免NaN/Inf导致崩溃）
-        bool init_guess_valid = initial_guess.allFinite();
-        if (!init_guess_valid) {
+        if (!initial_guess.allFinite()) {
             std::cout << "[GICP_OMP] 初始猜测矩阵包含NaN/Inf，跳过配准" << std::endl;
             py::dict result;
             result["transformation"] = Eigen::Matrix4d::Identity();
-            result["has_converged"] = false;
-            result["fitness_score"] = 1e9;
-            return result;
-        }
-
-        // 检查初始平移是否过大（超过15m可能导致崩溃）
-        if (init_t > 15.0) {
-            std::cout << "[GICP_OMP] 初始平移 " << init_t << "m > 15m，跳过配准避免崩溃" << std::endl;
-            py::dict result;
-            result["transformation"] = initial_guess.cast<double>();
             result["has_converged"] = false;
             result["fitness_score"] = 1e9;
             return result;
@@ -241,6 +284,9 @@ public:
             voxel.setInputCloud(target_cloud);
             voxel.filter(*tgt_ds);
         }
+        src_ds = removeInvalidPoints(src_ds);
+        tgt_ds = removeInvalidPoints(tgt_ds);
+
         std::cout << "[GICP_OMP] 粗配准: " << src_ds->size() << " vs " << tgt_ds->size()
                   << " pts (ds=" << coarse_ds_size << "m)" << std::endl;
 
@@ -252,6 +298,8 @@ public:
         coarse_gicp->setMaximumOptimizerIterations(max_optimizer_iterations_);
         coarse_gicp->setGICPEpsilon(gicp_epsilon_);
         coarse_gicp->setMaximumIterations(coarse_max_iter);
+        coarse_gicp->setSearchMethodTarget(std::make_shared<NaNCheckedKdTree>());
+        coarse_gicp->setSearchMethodSource(std::make_shared<NaNCheckedKdTree>());
         coarse_gicp->setInputSource(src_ds);
         coarse_gicp->setInputTarget(tgt_ds);
 
@@ -260,13 +308,13 @@ public:
             coarse_gicp->align(*tmp, initial_guess);
         } catch (const std::exception &e) {
             std::cout << "[GICP_OMP] 粗配准异常: " << e.what() << std::endl;
-            // 跳过GICP，直接使用BTC初值
             py::dict result;
             result["transformation"] = initial_guess.cast<double>();
             result["has_converged"] = false;
             result["fitness_score"] = 1e9;
             return result;
         }
+
         Eigen::Matrix4f T_coarse = coarse_gicp->getFinalTransformation();
         std::cout << "[GICP_OMP] 粗配准: converged=" << (coarse_gicp->hasConverged() ? "true" : "false")
                   << ", fitness=" << coarse_gicp->getFitnessScore() << std::endl;
@@ -280,6 +328,8 @@ public:
         fine_gicp->setMaximumOptimizerIterations(max_optimizer_iterations_);
         fine_gicp->setGICPEpsilon(gicp_epsilon_);
         fine_gicp->setMaximumIterations(fine_max_iter);
+        fine_gicp->setSearchMethodTarget(std::make_shared<NaNCheckedKdTree>());
+        fine_gicp->setSearchMethodSource(std::make_shared<NaNCheckedKdTree>());
         fine_gicp->setInputSource(source_cloud);
         fine_gicp->setInputTarget(target_cloud);
 
@@ -298,25 +348,22 @@ public:
         Eigen::Matrix4f final_T = fine_gicp->getFinalTransformation();
         bool converged = fine_gicp->hasConverged();
 
-        // ===== 与 registration_impl.cpp 一致的 fitness 计算方式 =====
-        // PCL基类 getFitnessScore() 对变换后的source做NN搜索求平均距离。
-        // 优秀匹配应在 0.01 以下。
-        double fitness = fine_gicp->getFitnessScore(1.0);  // max_range=1m，与在线一致
-        double fitness_all = fine_gicp->getFitnessScore();   // 不加限制的全局值（参考）
+        double fitness = fine_gicp->getFitnessScore(1.0);
+        double fitness_all = fine_gicp->getFitnessScore();
 
-        // 额外计算 overlap ratio（<=1m内点比例）
+        // 计算overlap ratio（<=1m内点比例）
         double overlap_ratio = 0.0;
         {
             pcl::PointCloud<pcl::PointXYZI>::Ptr src_trans(new pcl::PointCloud<pcl::PointXYZI>);
             pcl::transformPointCloud(*source_cloud, *src_trans, final_T);
-            pcl::KdTreeFLANN<pcl::PointXYZI> kdtree;
-            kdtree.setInputCloud(target_cloud);
+            auto overlap_kdtree = std::make_shared<NaNCheckedKdTree>();
+            overlap_kdtree->setInputCloud(target_cloud);
             int inlier_count = 0;
             for (size_t i = 0; i < src_trans->size(); ++i) {
-                std::vector<int> idx(1);
+                pcl::Indices idx(1);
                 std::vector<float> dist(1);
-                if (kdtree.nearestKSearch(src_trans->points[i], 1, idx, dist) > 0
-                    && dist[0] < 1.0f /* 1m^2 */) {
+                if (overlap_kdtree->nearestKSearch(src_trans->points[i], 1, idx, dist) > 0
+                    && dist[0] < 1.0f) {
                     inlier_count++;
                 }
             }
@@ -334,8 +381,8 @@ public:
         py::dict result;
         result["transformation"] = T_double;
         result["has_converged"] = converged;
-        result["fitness_score"] = fitness;       // PCL原生fitness(1m)，优秀匹配<0.01
-        result["overlap_ratio"] = overlap_ratio;  // 0~1，越大越好
+        result["fitness_score"] = fitness;
+        result["overlap_ratio"] = overlap_ratio;
         return result;
     }
 
@@ -357,7 +404,6 @@ private:
     GicpOmp::Ptr gicp_;
     int num_threads_ = 4;
 
-    // 默认配置参数（与在线版本一致）
     double corr_dist_threshold_ = 5.0;
     double transformation_epsilon_ = 5e-4;
     double rotation_epsilon_ = 2e-3;

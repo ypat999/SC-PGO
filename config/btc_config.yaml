@@ -322,7 +322,7 @@ gicp:
   #   - 0.15: 适中（适合Mid360稀疏点云）
   #   - 0.30: 宽松
   #   - 策略：放宽到0.25，作为最终把关（效果不好再收紧）
-  fitness_score_threshold: 0.25
+  fitness_score_threshold: 0.05
 
   # max_correspondence_distance: 最大对应点距离 (m)
   #   - GICP匹配时，两点距离 < 此阈值才算对应点
@@ -332,7 +332,7 @@ gicp:
 
   # max_iterations: 精配准最大迭代次数
   #   - 迭代次数上限，防止不收敛时无限循环
-  max_iterations: 64
+  max_iterations: 32
 
   # transformation_epsilon: 收敛精度（变换增量阈值）
   #   - 变换增量 < 此阈值时停止迭代（收敛）
