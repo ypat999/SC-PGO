@@ -1443,8 +1443,10 @@ class OfflineLoopCloser:
                 kf_idx_after = len(self.keyframe_indices) - 1
 
             if kf_idx_before == kf_idx_after:
-                # 当前帧前后是同一个关键帧，直接用该关键帧的位姿
-                T_opt = optimized_poses[kf_idx_before]
+                # 当前帧前后是同一个关键帧，将该校正量应用到当前帧的原始odom上
+                T_orig_kf = self.keyframe_poses[kf_idx_before]
+                T_corr = np.linalg.inv(T_orig_kf) @ optimized_poses[kf_idx_before]
+                T_opt = T_orig @ T_corr
             else:
                 # 线性插值权重（按原始帧索引距离）
                 o_before = self.keyframe_indices[kf_idx_before]
@@ -1637,9 +1639,9 @@ class OfflineLoopCloser:
             for T in poses:
                 R = T[:3, :3]
                 t = T[:3, 3]
-                f.write(f"{R[0,0]:.10f} {R[0,1]:.10f} {R[0,2]:.10f} {t[0]:.10f} "
-                        f"{R[1,0]:.10f} {R[1,1]:.10f} {R[1,2]:.10f} {t[1]:.10f} "
-                        f"{R[2,0]:.10f} {R[2,1]:.10f} {R[2,2]:.10f} {t[2]:.10f}\n")
+                f.write(f"{R[0,0]:.6f} {R[0,1]:.6f} {R[0,2]:.6f} {t[0]:.6f} "
+                        f"{R[1,0]:.6f} {R[1,1]:.6f} {R[1,2]:.6f} {t[1]:.6f} "
+                        f"{R[2,0]:.6f} {R[2,1]:.6f} {R[2,2]:.6f} {t[2]:.6f}\n")
 
     @staticmethod
     def _load_pcd(filepath):
