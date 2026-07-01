@@ -11,6 +11,8 @@
 """
 
 import os
+import concurrent.futures
+import threading
 import numpy as np
 from numpy import linalg as LA
 import yaml
@@ -533,7 +535,7 @@ class OfflineLoopCloser:
                  max_loop_distance=100.0, max_yaw_diff=None,
                  odom_direct_threshold=3.0, skip_near_num=5,
                  use_method='btc', sc_dist_thres=0.6, sc_max_radius=80.0,
-                 merge_n=1, ros_node=None):
+                 merge_n=1, num_threads=0, ros_node=None):
         """
         离线回环检测器 - 支持BTC和ScanContext两种方法
 
@@ -545,6 +547,7 @@ class OfflineLoopCloser:
             use_method: str, 默认'btc'。回环检测方法 ('btc' or 'sc')
             sc_dist_thres: float, 默认0.6。ScanContext距离阈值
             sc_max_radius: float, 默认80.0。ScanContext最大半径
+            num_threads: int, 默认0。多线程加速线程数 (0=自动检测CPU核心数)
             ros_node: rclpy.Node 或 None，若提供则发布 odom_path / optimized_path / loop_match_markers
                       话题用于 RViz 可视化比较 PGO 效果
         """
@@ -554,6 +557,9 @@ class OfflineLoopCloser:
         self.odom_direct_threshold = odom_direct_threshold
         self.skip_near_num = skip_near_num
         self.use_method = use_method  # 回环检测方法选择
+        # 多线程参数: 0=自动检测CPU核心数
+        self.num_threads = num_threads if num_threads > 0 else os.cpu_count() or 4
+        self._btc_lock = threading.Lock()  # 保护C++ BTC数据库的线程安全
 
         # BTC C++ 模块
         if HAS_BTC_CPP and use_method == 'btc':
@@ -641,15 +647,15 @@ class OfflineLoopCloser:
                 print("[WARN] rclpy 不可用，ros_node 参数将被忽略")
                 self.ros_node = None
             else:
+                # TRANSIENT_LOCAL 让晚加入的订阅者也能收到最新数据
+                qos = rclpy.qos.QoSProfile(depth=10,
+                                           durability=rclpy.qos.DurabilityPolicy.TRANSIENT_LOCAL)
                 self._ros_pub_odom_path = ros_node.create_publisher(
-                    RosPath, 'odom_keyframe_path', 10)
+                    RosPath, 'odom_keyframe_path', qos)
                 self._ros_pub_optimized_path = ros_node.create_publisher(
-                    RosPath, 'optimized_path', 10)
-                # transient_local 让晚加入的订阅者也能收到所有已发布的回环标记
+                    RosPath, 'optimized_path', qos)
                 self._ros_pub_loop_markers = ros_node.create_publisher(
-                    RosMarkerArray, 'loop_match_markers',
-                    rclpy.qos.QoSProfile(depth=10,
-                                         durability=rclpy.qos.DurabilityPolicy.TRANSIENT_LOCAL))
+                    RosMarkerArray, 'loop_match_markers', qos)
                 print("[ROS2] 离线回环可视化已启用: odom_keyframe_path / optimized_path / loop_match_markers")
 
     def load_data(self, data_dir=None):
@@ -826,6 +832,9 @@ class OfflineLoopCloser:
         for T in poses_list:
             msg.poses.append(self._matrix_to_pose_stamped(T, frame_id))
         publisher.publish(msg)
+        # 强制刷新确保消息发到wire
+        import rclpy
+        rclpy.spin_once(self.ros_node, timeout_sec=0.0)
 
     def _ros_publish_loop_markers(self, prev_idx, curr_idx, score,
                                   pose_prev, pose_curr, frame_id='odom'):
@@ -910,6 +919,9 @@ class OfflineLoopCloser:
         marker_array.markers.append(m_text)
 
         self._ros_pub_loop_markers.publish(marker_array)
+        # 强制刷新确保消息发到wire（rclpy publish() 是异步入队，需spin_once触发发送）
+        import rclpy
+        rclpy.spin_once(self.ros_node, timeout_sec=0.0)
 
     def run(self):
         """执行完整的离线回环流程"""
@@ -934,48 +946,45 @@ class OfflineLoopCloser:
         # 发布原始 odom 关键帧轨迹（PGO 输入），用于在 RViz 中与优化结果对比
         self._ros_publish_path(self.keyframe_poses, self._ros_pub_odom_path)
 
-        # ===== 步骤 2: BTC 描述子生成 + 数据库构建 =====
-        print("\n===== 步骤 2: BTC 描述子生成 =====")
+        # ===== 步骤 2: BTC 描述子生成 + 数据库构建 (多线程加速) =====
+        print("\n===== 步骤 2: BTC 描述子生成 (多线程加速) =====")
+        print(f"  线程数: {self.num_threads}")
         total_btcs = 0
         zero_btc_frames = 0
-        for i in range(len(self.keyframe_clouds)):
-            cloud = self.keyframe_clouds[i]
-            if len(cloud) < 10:
-                zero_btc_frames += 1
-                if zero_btc_frames <= 5 or i == len(self.keyframe_clouds) - 1:
-                    print(f"  [WARN] 关键帧 {i} 点云点数不足: {len(cloud)}，跳过")
-                continue
+        step2_total = len(self.keyframe_clouds)
+        step2_done = 0
 
-            try:
-                # C++ BTC: AddBtcDescs需要Nx4 numpy数组
-                # 将Nx3点云转换为Nx4（添加intensity）
-                if cloud.shape[1] == 3:
-                    cloud_with_intensity = np.hstack([cloud, np.zeros((len(cloud), 1))])
-                else:
-                    cloud_with_intensity = cloud
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.num_threads) as executor:
+            futures = {
+                executor.submit(self._process_frame_step2, i): i
+                for i in range(step2_total)
+            }
 
-                # 提取关键帧odom位置（用于预过滤候选帧）
-                pose = self.keyframe_poses[i]
-                frame_position = pose[:3, 3]  # 提取平移部分 (x, y, z)
+            for future in concurrent.futures.as_completed(futures):
+                i = futures[future]
+                try:
+                    frame_result = future.result()
+                except Exception as e:
+                    print(f"  [ERROR] 关键帧 {i} BTC生成异常: {e}")
+                    continue
 
-                # 添加到数据库（传入帧位置）
-                self.btc_manager.AddBtcDescs(cloud_with_intensity, i, frame_position)
-                # 获取BTC数量
-                result = self.btc_manager.GenerateBtcDescs(cloud_with_intensity, i)
-                num_btcs = result['num_btcs']
+                if frame_result is None:
+                    continue
 
-                total_btcs += num_btcs
-                if num_btcs == 0:
+                step2_done += 1
+                total_btcs += frame_result['num_btcs']
+
+                if frame_result['num_btcs'] == 0:
                     zero_btc_frames += 1
 
-                if i % 10 == 0 or i == len(self.keyframe_clouds) - 1 or num_btcs == 0:
-                    print(f"  关键帧 {i}/{len(self.keyframe_clouds)} | 点云: {len(cloud)} pts | BTC: {num_btcs} | 累计: {total_btcs}")
-                    
-            except Exception as e:
-                print(f"  [ERROR] 关键帧 {i} BTC生成失败: {e}")
-                import traceback
-                traceback.print_exc()
-                continue
+                if not frame_result['success']:
+                    if zero_btc_frames <= 5 or i == step2_total - 1:
+                        print(f"  [WARN] 关键帧 {i}: {frame_result.get('error', '失败')}")
+                elif frame_result['num_btcs'] == 0:
+                    if zero_btc_frames <= 5 or i == step2_total - 1:
+                        print(f"  [WARN] 关键帧 {i} 点数={frame_result['n_pts']}, BTC=0, 跳过")
+                elif step2_done % 20 == 0 or i == step2_total - 1 or step2_done <= 5:
+                    print(f"  关键帧 {i}/{step2_total} | 点云: {frame_result['n_pts']} pts | BTC: {frame_result['num_btcs']} | 累计: {total_btcs}")
         
         # Step 2 汇总
         print(f"\n  ----- Step 2 汇总 -----")
@@ -985,286 +994,53 @@ class OfflineLoopCloser:
         print(f"  数据库大小: {db_size}")
 
         # ===== 步骤 3: 回环检测 + GICP 精化 + 验证 =====
-        print("\n===== 步骤 3: 回环检测 =====")
+        print("\n===== 步骤 3: 回环检测 (多线程加速) =====")
+        print(f"  线程数: {self.num_threads}")
         loop_constraints = []  # [(prev_idx, curr_idx, relative_pose_4x4, score), ...]
         step3_no_btc_frames = 0
         step3_search_count = 0
         step3_loop_count = 0
-        odom_direct_verify_count = 0  # 新增：odom距离直接验证计数
+        odom_direct_verify_count = 0
 
-        # 新增：odom距离阈值（小于此值直接做GICP，跳过BTC）
-        odom_direct_threshold = self.odom_direct_threshold  # 从配置文件读取
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.num_threads) as executor:
+            # 提交所有帧到线程池
+            futures = {
+                executor.submit(self._process_frame_step3, i): i
+                for i in range(len(self.keyframe_clouds))
+            }
 
-        for i in range(len(self.keyframe_clouds)):
-            cloud = self.keyframe_clouds[i]
-            if len(cloud) < 10:
-                print(f"  [Step3] 帧 {i}/{len(self.keyframe_clouds)}: 点云点数不足 ({len(cloud)})，跳过")
-                continue
+            # 收集结果
+            for future in concurrent.futures.as_completed(futures):
+                i = futures[future]
+                try:
+                    frame_result = future.result()
+                except Exception as e:
+                    print(f"  [ERROR] 帧 {i} 处理异常: {e}")
+                    continue
 
-            step3_search_count += 1
+                if frame_result is None:
+                    continue
 
-            # 提取当前帧odom位置（用于预过滤候选帧）
-            pose = self.keyframe_poses[i]
-            current_position = pose[:3, 3]  # 提取平移部分 (x, y, z)
+                # ==== 在主线程中安全地更新共享状态 ====
+                if frame_result.get('no_btc'):
+                    step3_no_btc_frames += 1
 
-            # ===== 新增策略: Odom距离直接验证 =====
-            # 1. 先检查所有候选帧的odom距离
-            odom_direct_candidates = []
-            skip_near_num = self.skip_near_num  # 从配置文件读取
-            for j in range(len(self.keyframe_clouds)):
-                # 跳过当前帧和邻近帧（帧号差值必须 > skip_near_num）
-                if j >= i:
-                    continue  # 跳过当前帧和后面的帧
-                frame_diff = i - j
-                if frame_diff <= skip_near_num:
-                    continue  # 跳过邻近帧（帧号差值太小）
+                if frame_result.get('searched'):
+                    step3_search_count += 1
 
-                prev_pose = self.keyframe_poses[j]
-                prev_position = prev_pose[:3, 3]
-                odom_distance = np.linalg.norm(current_position - prev_position)
+                if frame_result.get('loop_found'):
+                    step3_loop_count += 1
 
-                # odom距离 < 3米：直接验证候选
-                if odom_distance < odom_direct_threshold:
-                    odom_direct_candidates.append((j, odom_distance))
+                if frame_result.get('odom_direct'):
+                    odom_direct_verify_count += 1
 
-            # 2. 对odom距离很近的候选帧，直接做GICP验证（跳过BTC）
-            if odom_direct_candidates and self.use_gicp and HAS_GICP_OMP:
-                for (candidate_id, odom_dist) in odom_direct_candidates:
-                    print(f"  [Odom Direct] 帧 {i} <-> {candidate_id} odom距离 {odom_dist:.2f}m < {odom_direct_threshold}m，直接GICP验证")
+                constraint = frame_result.get('constraint')
+                if constraint is not None:
+                    loop_constraints.append(constraint)
 
-                    # 计算相对位姿初值（从odom推算）
-                    # keyframe_poses: world-from-body (odom姿态)
-                    # relative_pose = inv(prev_pose) @ curr_pose → prev_frame←curr_frame 变换
-                    curr_pose = self.keyframe_poses[i]
-                    prev_pose = self.keyframe_poses[candidate_id]
-                    relative_pose_matrix = np.linalg.inv(prev_pose) @ curr_pose
-                    odom_init_t = np.linalg.norm(relative_pose_matrix[:3, 3])
-                    print(f"  [Odom Direct] odom相对变换: t={odom_init_t:.3f}m, R(欧拉)={np.rad2deg(self._rot_to_euler(relative_pose_matrix[:3,:3]))}°")
-
-                    # GICP验证（source=curr帧点云, target=prev帧点云, init=curr→prev变换）
-                    gicp_result = gicp_align(
-                        self.keyframe_clouds_ds[i],
-                        self.keyframe_clouds_ds[candidate_id],
-                        initial_guess=relative_pose_matrix,
-                        config=self.gicp_config
-                    )
-
-                    # 无论验证是否成功，都保存融合点云供目视检查
-                    if gicp_result and gicp_result.has_converged:
-                        self._save_fused_cloud(i, candidate_id, gicp_result.transformation,
-                                               relative_pose_matrix, gicp_result.fitness_score,
-                                               gicp_result.overlap_ratio, 'odom_direct')
-
-                    if (gicp_result and gicp_result.has_converged and
-                            gicp_result.fitness_score < self.gicp_config.fitness_score_threshold):
-                        # 检查退化方向
-                        is_degenerate, deg_dir, eigvals = check_degeneracy(
-                            self.keyframe_clouds_ds[i],
-                            self.keyframe_clouds_ds[candidate_id],
-                            gicp_result.transformation,
-                            max_correspondence_distance=self.gicp_config.max_correspondence_distance
-                        )
-
-                        if not is_degenerate:
-                            odom_direct_verify_count += 1
-                            step3_loop_count += 1
-                            print(f"  [Odom Direct SUCCESS] 回环验证成功! {candidate_id} <-> {i}, GICP fitness: {gicp_result.fitness_score:.4f}")
-
-                            # 计算显示信息
-                            T_delta = gicp_result.transformation
-                            t_vec = T_delta[:3, 3]
-                            roll, pitch, yaw = _extract_rpy(T_delta)
-
-                            # 存储回环约束（统一格式）
-                            loop_constraints.append((
-                                candidate_id, i, gicp_result.transformation, 0.0, 'odom_direct'
-                            ))
-                            self.loop_pairs.append((
-                                candidate_id, i,
-                                f"{self.keyframe_indices[candidate_id]:06d}.pcd",
-                                f"{self.keyframe_indices[i]:06d}.pcd",
-                                0.0, gicp_result.fitness_score,
-                                t_vec[0], t_vec[1], t_vec[2],
-                                roll, pitch, yaw
-                            ))
-                            # 发布回环匹配点 + 连线（odom_direct 路径，score 用 fitness 替代）
-                            self._ros_publish_loop_markers(
-                                candidate_id, i, gicp_result.fitness_score,
-                                self.keyframe_poses[candidate_id],
-                                self.keyframe_poses[i])
-                            break  # 找到一个就跳出（避免重复验证）
-
-            # ===== BTC匹配流程（正常流程） =====
-            # C++ SearchLoop（使用已生成的BTC描述子）
-            if cloud.shape[1] == 3:
-                cloud_with_intensity = np.hstack([cloud, np.zeros((len(cloud), 1))])
-            else:
-                cloud_with_intensity = cloud
-
-            # 生成当前帧BTC描述子（用于搜索）
-            result = self.btc_manager.GenerateBtcDescs(cloud_with_intensity, i)
-            num_btcs = result['num_btcs']
-
-            if num_btcs == 0:
-                step3_no_btc_frames += 1
-                print(f"  [Step3] 帧 {i}/{len(self.keyframe_clouds)}: BTC=0, 跳过")
-                continue
-
-            print(f"  [Step3] 帧 {i}/{len(self.keyframe_clouds)}: 点云 {len(cloud)} pts, BTC={num_btcs}, 正在搜索回环...")
-
-            # C++ SearchLoop（返回字典）
-            result = self.btc_manager.SearchLoop(cloud_with_intensity, i, current_position)
-            match_frame_id = result['match_frame_id']
-            loop_score = result['match_score']
-            candidates = result.get('candidate_frame_ids', [])
-
-            # 诊断：SearchLoop返回的候选帧（从C++ candidate_matcher_vec收集）
-            if match_frame_id == -1:
-                if len(candidates) > 0:
-                    print(f"  [BTC Diag] frame={i}, {len(candidates)} candidates, none passed verification")
-                else:
-                    print(f"  [BTC Diag] frame={i}, 0 candidates (no hash hits at all)")
-
-            # 从字典中提取位姿
-            if match_frame_id != -1:
-                t = np.array(result['translation'])
-                R = np.array(result['rotation'])
-                relative_pose_matrix = np.eye(4)
-                relative_pose_matrix[:3, :3] = R
-                relative_pose_matrix[:3, 3] = t
-            else:
-                relative_pose_matrix = None
-
-            # 回环处理（统一流程）
-            if match_frame_id != -1 and relative_pose_matrix is not None:
-                step3_loop_count += 1
-                prev_idx = match_frame_id
-                curr_idx = i
-                print(f"  [BTC Loop] 检测到回环! {prev_idx} <-> {curr_idx}, score: {loop_score:.4f}")
-
-                # GICP 精化 (对应 C++ performSCLoopClosure 中的 GICP 逻辑)
-                gicp_success = False
-                gicp_fitness = 0.0
-                if self.use_gicp and HAS_GICP_OMP:
-                    # ===== 新增策略: 使用odom位姿作为GICP初值（比BTC位姿更准确） =====
-                    # 计算odom相对位姿（从关键帧位姿推算）
-                    curr_pose = self.keyframe_poses[curr_idx]
-                    prev_pose = self.keyframe_poses[prev_idx]
-                    odom_relative_pose = np.linalg.inv(prev_pose) @ curr_pose
-
-                    # 选择初值：优先使用odom位姿（更准确），BTC位姿作为备选
-                    init_translation_btc = np.linalg.norm(relative_pose_matrix[:3, 3])
-                    init_translation_odom = np.linalg.norm(odom_relative_pose[:3, 3])
-
-                    # 如果odom平移 < BTC平移，说明BTC位姿不准，使用odom位姿
-                    if init_translation_odom < init_translation_btc:
-                        initial_guess = odom_relative_pose
-                        print(f"  [GICP] 使用odom位姿作为初值 (odom={init_translation_odom:.2f}m < BTC={init_translation_btc:.2f}m)")
-                    else:
-                        initial_guess = relative_pose_matrix
-                        print(f"  [GICP] 使用BTC位姿作为初值 (BTC={init_translation_btc:.2f}m <= odom={init_translation_odom:.2f}m)")
-
-                    # 初始平移过大直接跳过（避免GICP崩溃）
-                    init_translation = np.linalg.norm(initial_guess[:3, 3])
-                    if init_translation > self.gicp_config.max_init_translation:  # 从yaml读取阈值
-                        print(f"  [GICP] 初始平移 {init_translation:.1f}m > {self.gicp_config.max_init_translation}m，跳过")
-                        continue
-
-                    # 使用self.gicp_config（保留配置文件中的参数）
-                    gicp_result = gicp_align(
-                        self.keyframe_clouds_ds[curr_idx],
-                        self.keyframe_clouds_ds[prev_idx],
-                        initial_guess=initial_guess,
-                        config=self.gicp_config
-                    )
-                    # 校验: Fitness Score
-                    if (gicp_result and gicp_result.has_converged and
-                            gicp_result.fitness_score < self.gicp_config.fitness_score_threshold):
-
-                        # 校验: 退化方向检查
-                        is_degenerate, deg_dir, eigvals = check_degeneracy(
-                            self.keyframe_clouds_ds[curr_idx],
-                            self.keyframe_clouds_ds[prev_idx],
-                            gicp_result.transformation,
-                            max_correspondence_distance=self.gicp_config.max_correspondence_distance
-                        )
-
-                        if not is_degenerate:
-                            relative_pose_matrix = gicp_result.transformation
-                            gicp_success = True
-                            gicp_fitness = gicp_result.fitness_score
-                            print(f"  [GICP] 精化成功! Fitness: {gicp_result.fitness_score:.4f}")
-
-                            # 保存融合点云供目视检查
-                            self._save_fused_cloud(curr_idx, prev_idx, gicp_result.transformation,
-                                                   initial_guess, gicp_result.fitness_score,
-                                                   gicp_result.overlap_ratio, 'btc_loop')
-                        else:
-                            print(f"  [GICP] 检测到退化方向，拒绝回环!")
-                            continue
-
-                    else:
-                        fitness = gicp_result.fitness_score if gicp_result else float('inf')
-                        print(f"  [GICP] 精化失败或分数过高 ({fitness:.4f} > {self.gicp_config.fitness_score_threshold})，拒绝回环!")
-                        continue
-
-                # 回环验证 (对应 C++ validateLoopClosure)
-                if validate_loop_closure(
-                        self.keyframe_poses[prev_idx],
-                        self.keyframe_poses[curr_idx],
-                        relative_pose_matrix,
-                        max_loop_distance=self.max_loop_distance,
-                        max_yaw_diff=self.max_yaw_diff):
-                    # 找到对应的原始 scan 索引
-                    merged_prev = self.keyframe_indices[prev_idx]
-                    merged_curr = self.keyframe_indices[curr_idx]
-                    if self.merge_n > 1 and self.merge_indices:
-                        orig_prev_range = self.merge_indices[merged_prev]
-                        orig_curr_range = self.merge_indices[merged_curr]
-                        scan_prev_name = f"{orig_prev_range[0]:06d}-{orig_prev_range[-1]:06d}.pcd"
-                        scan_curr_name = f"{orig_curr_range[0]:06d}-{orig_curr_range[-1]:06d}.pcd"
-                        display_prev = f"{merged_prev} (orig {orig_prev_range[0]}-{orig_prev_range[-1]})"
-                        display_curr = f"{merged_curr} (orig {orig_curr_range[0]}-{orig_curr_range[-1]})"
-                    else:
-                        scan_prev_name = f"{merged_prev:06d}.pcd"
-                        scan_curr_name = f"{merged_curr:06d}.pcd"
-                        display_prev = f"{merged_prev:06d}"
-                        display_curr = f"{merged_curr:06d}"
-                    # 计算相对位姿 (从 prev 到 curr)
-                    T_delta = np.linalg.inv(self.keyframe_poses[prev_idx]) @ self.keyframe_poses[curr_idx]
-                    t_vec = T_delta[:3, 3]
-                    roll, pitch, yaw = _extract_rpy(T_delta)
-                    print(f"\n  ===== 回环验证通过 =====")
-                    print(f"  KeyFrame: {prev_idx} (Scan {display_prev}) <-> KeyFrame {curr_idx} (Scan {display_curr})")
-                    print(f"  BTC score: {loop_score:.4f}, GICP fitness: {gicp_fitness:.4f}")
-                    print(f"  PCD文件: Scans/{scan_prev_name} <-> Scans/{scan_curr_name}")
-                    print(f"  相对平移: [{t_vec[0]:.3f}, {t_vec[1]:.3f}, {t_vec[2]:.3f}] m")
-                    print(f"  相对旋转 (RPY): [{roll:.3f}, {pitch:.3f}, {yaw:.3f}] rad")
-                    
-                    # GICP失败时拒绝回环（不使用BTC原始位姿）
-                    if not gicp_success:
-                        print(f"  [WARN] GICP失败，拒绝此回环（BTC原始位姿可能错误）")
-                        print(f"  =========================\n")
-                        continue  # ← 跳过此回环
-                    
-                    print(f"  (使用GICP精化后的位姿)")
-                    print(f"  =========================\n")
-
-                    relative_pose_gtsam = matrix_to_gtsam_pose3(relative_pose_matrix)
-                    loop_constraints.append((prev_idx, curr_idx, relative_pose_matrix, loop_score, 'btc'))
-                    self.loop_pairs.append((
-                        prev_idx, curr_idx,
-                        scan_prev_name, scan_curr_name,
-                        loop_score, gicp_fitness,
-                        t_vec[0], t_vec[1], t_vec[2],
-                        roll, pitch, yaw
-                    ))
-                    print(f"  [BTC Loop] 回环约束已添加: {prev_idx} <-> {curr_idx}")
-                    # 发布回环匹配点 + 连线（用关键帧原始 odom 位姿，与 odom_path 一致便于辨认位置）
-                    self._ros_publish_loop_markers(
-                        prev_idx, curr_idx, loop_score,
-                        self.keyframe_poses[prev_idx],
-                        self.keyframe_poses[curr_idx])
+                loop_pair = frame_result.get('loop_pair')
+                if loop_pair is not None:
+                    self.loop_pairs.append(loop_pair)
 
         print(f"\n  ----- Step 3 汇总 -----")
         print(f"  搜索帧数: {step3_search_count}")
@@ -1298,6 +1074,312 @@ class OfflineLoopCloser:
         self._save_results(optimized_poses)
 
         return optimized_poses
+
+    def _process_frame_step2(self, i):
+        """
+        处理单个关键帧的BTC描述子生成（Step 2 原子操作），供多线程调用。
+        用 self._btc_lock 保护 C++ btc_manager 的数据库操作。
+
+        返回值 dict:
+          - num_btcs: int
+          - n_pts: int
+          - success: bool
+          - error: str or None
+        """
+        result = {'num_btcs': 0, 'n_pts': 0, 'success': False, 'error': None}
+
+        cloud = self.keyframe_clouds[i]
+        if len(cloud) < 10:
+            result['error'] = f'点数不足: {len(cloud)}'
+            return result
+
+        result['n_pts'] = len(cloud)
+
+        try:
+            if cloud.shape[1] == 3:
+                cloud_with_intensity = np.hstack([cloud, np.zeros((len(cloud), 1))])
+            else:
+                cloud_with_intensity = cloud
+
+            pose = self.keyframe_poses[i]
+            frame_position = pose[:3, 3]
+
+            # C++ 数据库操作需要加锁
+            with self._btc_lock:
+                self.btc_manager.AddBtcDescs(cloud_with_intensity, i, frame_position)
+                btc_result = self.btc_manager.GenerateBtcDescs(cloud_with_intensity, i)
+                num_btcs = btc_result['num_btcs']
+
+            result['num_btcs'] = num_btcs
+            result['success'] = True
+
+        except Exception as e:
+            result['error'] = str(e)
+
+        return result
+
+    def _process_frame_step3(self, i):
+        """
+        处理单个关键帧的回环检测（Step 3 原子操作），供多线程调用。
+
+        返回值 dict (或 None):
+          - constraint: (prev_idx, curr_idx, rel_pose, score, loop_type) or None
+          - loop_pair: tuple for self.loop_pairs or None
+          - no_btc: bool (BTC=0跳过)
+          - searched: bool (执行了搜索)
+          - loop_found: bool (找到回环)
+          - odom_direct: bool (通过Odom直接验证)
+
+        注意: 此方法不修改 self.loop_pairs / loop_constraints, 但会立即发布ROS话题。
+        _save_fused_cloud 是线程安全的文件写入, 可在子线程中调用。
+        Python print 是线程安全的(因GIL)，日志可直接输出。
+        """
+        result = {
+            'constraint': None,
+            'loop_pair': None,
+            'no_btc': False,
+            'searched': False,
+            'loop_found': False,
+            'odom_direct': False,
+        }
+
+        cloud = self.keyframe_clouds[i]
+        total_kf = len(self.keyframe_clouds)
+        if len(cloud) < 10:
+            return result
+
+        result['searched'] = True
+
+        pose = self.keyframe_poses[i]
+        current_position = pose[:3, 3]
+
+        # ===== Odom距离直接验证 =====
+        odom_direct_candidates = []
+        skip_near_num = self.skip_near_num
+        for j in range(len(self.keyframe_clouds)):
+            if j >= i:
+                continue
+            frame_diff = i - j
+            if frame_diff <= skip_near_num:
+                continue
+            prev_pose = self.keyframe_poses[j]
+            prev_position = prev_pose[:3, 3]
+            odom_distance = np.linalg.norm(current_position - prev_position)
+            if odom_distance < self.odom_direct_threshold:
+                odom_direct_candidates.append((j, odom_distance))
+
+        if odom_direct_candidates and self.use_gicp and HAS_GICP_OMP:
+            for (candidate_id, odom_dist) in odom_direct_candidates:
+                print(f"  [Odom Direct] 帧 {i} <-> {candidate_id} "
+                      f"odom距离 {odom_dist:.2f}m < {self.odom_direct_threshold}m, 直接GICP验证")
+                curr_pose = self.keyframe_poses[i]
+                prev_pose = self.keyframe_poses[candidate_id]
+                relative_pose_matrix = np.linalg.inv(prev_pose) @ curr_pose
+
+                gicp_result = gicp_align(
+                    self.keyframe_clouds_ds[i],
+                    self.keyframe_clouds_ds[candidate_id],
+                    initial_guess=relative_pose_matrix,
+                    config=self.gicp_config
+                )
+
+                if gicp_result and gicp_result.has_converged:
+                    self._save_fused_cloud(i, candidate_id, gicp_result.transformation,
+                                           relative_pose_matrix, gicp_result.fitness_score,
+                                           gicp_result.overlap_ratio, 'odom_direct')
+
+                if (gicp_result and gicp_result.has_converged and
+                        gicp_result.fitness_score < self.gicp_config.fitness_score_threshold):
+                    is_degenerate, deg_dir, eigvals = check_degeneracy(
+                        self.keyframe_clouds_ds[i],
+                        self.keyframe_clouds_ds[candidate_id],
+                        gicp_result.transformation,
+                        max_correspondence_distance=self.gicp_config.max_correspondence_distance
+                    )
+                    if not is_degenerate:
+                        print(f"  [Odom Direct SUCCESS] 回环验证成功! "
+                              f"{candidate_id} <-> {i}, GICP fitness: {gicp_result.fitness_score:.4f}")
+                        result['odom_direct'] = True
+                        result['loop_found'] = True
+                        T_delta = gicp_result.transformation
+                        t_vec = T_delta[:3, 3]
+                        roll, pitch, yaw = _extract_rpy(T_delta)
+                        result['constraint'] = (
+                            candidate_id, i, gicp_result.transformation, 0.0, 'odom_direct'
+                        )
+                        result['loop_pair'] = (
+                            candidate_id, i,
+                            f"{self.keyframe_indices[candidate_id]:06d}.pcd",
+                            f"{self.keyframe_indices[i]:06d}.pcd",
+                            0.0, gicp_result.fitness_score,
+                            t_vec[0], t_vec[1], t_vec[2],
+                            roll, pitch, yaw
+                        )
+                        # 找到回环立即发布到 RViz
+                        self._ros_publish_loop_markers(
+                            candidate_id, i, gicp_result.fitness_score,
+                            self.keyframe_poses[candidate_id],
+                            self.keyframe_poses[i])
+                        return result
+
+        # ===== BTC匹配流程 =====
+        if cloud.shape[1] == 3:
+            cloud_with_intensity = np.hstack([cloud, np.zeros((len(cloud), 1))])
+        else:
+            cloud_with_intensity = cloud
+
+        with self._btc_lock:
+            btc_result = self.btc_manager.GenerateBtcDescs(cloud_with_intensity, i)
+            num_btcs = btc_result['num_btcs']
+
+        if num_btcs == 0:
+            result['no_btc'] = True
+            print(f"  [Step3] 帧 {i}/{total_kf} | 点云 {len(cloud)} pts | BTC=0, 跳过")
+            return result
+
+        # 每50帧或匹配到时打印一次搜索日志
+        if i % 50 == 0 or i == total_kf - 1:
+            print(f"  [Step3] 帧 {i}/{total_kf} | 点云 {len(cloud)} pts | BTC={num_btcs}, 搜索中...")
+
+        # C++ SearchLoop
+        with self._btc_lock:
+            search_result = self.btc_manager.SearchLoop(cloud_with_intensity, i, current_position)
+        match_frame_id = search_result['match_frame_id']
+        loop_score = search_result['match_score']
+
+        if match_frame_id == -1:
+            candidates = search_result.get('candidate_frame_ids', [])
+            if len(candidates) > 0:
+                print(f"  [BTC Diag] frame={i}, {len(candidates)} candidates, none passed verification")
+            return result
+
+        t = np.array(search_result['translation'])
+        R = np.array(search_result['rotation'])
+        relative_pose_matrix = np.eye(4)
+        relative_pose_matrix[:3, :3] = R
+        relative_pose_matrix[:3, 3] = t
+
+        # GICP 精化
+        prev_idx = match_frame_id
+        curr_idx = i
+        print(f"  [BTC Loop] 检测到回环! {prev_idx} <-> {curr_idx}, score: {loop_score:.4f}")
+        gicp_success = False
+        gicp_fitness = 0.0
+
+        if self.use_gicp and HAS_GICP_OMP:
+            curr_pose = self.keyframe_poses[curr_idx]
+            prev_pose = self.keyframe_poses[prev_idx]
+            odom_relative_pose = np.linalg.inv(prev_pose) @ curr_pose
+
+            init_translation_btc = np.linalg.norm(relative_pose_matrix[:3, 3])
+            init_translation_odom = np.linalg.norm(odom_relative_pose[:3, 3])
+
+            if init_translation_odom < init_translation_btc:
+                initial_guess = odom_relative_pose
+                print(f"  [GICP] 使用odom位姿作为初值 "
+                      f"(odom={init_translation_odom:.2f}m < BTC={init_translation_btc:.2f}m)")
+            else:
+                initial_guess = relative_pose_matrix
+                print(f"  [GICP] 使用BTC位姿作为初值 "
+                      f"(BTC={init_translation_btc:.2f}m <= odom={init_translation_odom:.2f}m)")
+
+            init_translation = np.linalg.norm(initial_guess[:3, 3])
+            if init_translation > self.gicp_config.max_init_translation:
+                print(f"  [GICP] 初始平移 {init_translation:.1f}m > "
+                      f"{self.gicp_config.max_init_translation}m，跳过")
+                return result
+
+            gicp_result = gicp_align(
+                self.keyframe_clouds_ds[curr_idx],
+                self.keyframe_clouds_ds[prev_idx],
+                initial_guess=initial_guess,
+                config=self.gicp_config
+            )
+
+            if (gicp_result and gicp_result.has_converged and
+                    gicp_result.fitness_score < self.gicp_config.fitness_score_threshold):
+                is_degenerate, deg_dir, eigvals = check_degeneracy(
+                    self.keyframe_clouds_ds[curr_idx],
+                    self.keyframe_clouds_ds[prev_idx],
+                    gicp_result.transformation,
+                    max_correspondence_distance=self.gicp_config.max_correspondence_distance
+                )
+                if not is_degenerate:
+                    relative_pose_matrix = gicp_result.transformation
+                    gicp_success = True
+                    gicp_fitness = gicp_result.fitness_score
+                    print(f"  [GICP] 精化成功! Fitness: {gicp_result.fitness_score:.4f}")
+                    self._save_fused_cloud(curr_idx, prev_idx, gicp_result.transformation,
+                                           initial_guess, gicp_result.fitness_score,
+                                           gicp_result.overlap_ratio, 'btc_loop')
+                else:
+                    print(f"  [GICP] 检测到退化方向，拒绝回环!")
+                    return result
+            else:
+                fitness = gicp_result.fitness_score if gicp_result else float('inf')
+                print(f"  [GICP] 精化失败或分数过高 "
+                      f"({fitness:.4f} > {self.gicp_config.fitness_score_threshold})，拒绝回环!")
+                return result
+
+            if not gicp_success:
+                return result
+        else:
+            # 无GICP时直接使用BTC位姿
+            gicp_success = True
+
+        # 回环验证 (对应 C++ validateLoopClosure)
+        if not validate_loop_closure(
+                self.keyframe_poses[prev_idx],
+                self.keyframe_poses[curr_idx],
+                relative_pose_matrix,
+                max_loop_distance=self.max_loop_distance,
+                max_yaw_diff=self.max_yaw_diff):
+            return result
+
+        if self.use_gicp and HAS_GICP_OMP and not gicp_success:
+            print(f"  [WARN] GICP失败，拒绝此回环（BTC原始位姿可能错误）")
+            return result
+
+        result['loop_found'] = True
+        merged_prev = self.keyframe_indices[prev_idx]
+        merged_curr = self.keyframe_indices[curr_idx]
+
+        if self.merge_n > 1 and self.merge_indices:
+            orig_prev_range = self.merge_indices[merged_prev]
+            orig_curr_range = self.merge_indices[merged_curr]
+            scan_prev_name = f"{orig_prev_range[0]:06d}-{orig_prev_range[-1]:06d}.pcd"
+            scan_curr_name = f"{orig_curr_range[0]:06d}-{orig_curr_range[-1]:06d}.pcd"
+        else:
+            scan_prev_name = f"{merged_prev:06d}.pcd"
+            scan_curr_name = f"{merged_curr:06d}.pcd"
+
+        T_delta = np.linalg.inv(self.keyframe_poses[prev_idx]) @ self.keyframe_poses[curr_idx]
+        t_vec = T_delta[:3, 3]
+        roll, pitch, yaw = _extract_rpy(T_delta)
+
+        print(f"  ===== 回环验证通过 =====")
+        print(f"  KeyFrame: {prev_idx} <-> {curr_idx} | "
+              f"Scan {scan_prev_name} <-> {scan_curr_name}")
+        print(f"  BTC score: {loop_score:.4f}, GICP fitness: {gicp_fitness:.4f}")
+        print(f"  相对平移: [{t_vec[0]:.3f}, {t_vec[1]:.3f}, {t_vec[2]:.3f}] m")
+        print(f"  相对旋转 (RPY): [{roll:.3f}, {pitch:.3f}, {yaw:.3f}] rad")
+        print(f"  ========================")
+
+        result['constraint'] = (prev_idx, curr_idx, relative_pose_matrix, loop_score, 'btc')
+        result['loop_pair'] = (
+            prev_idx, curr_idx,
+            scan_prev_name, scan_curr_name,
+            loop_score, gicp_fitness,
+            t_vec[0], t_vec[1], t_vec[2],
+            roll, pitch, yaw
+        )
+        # 找到回环立即发布到 RViz
+        self._ros_publish_loop_markers(
+            prev_idx, curr_idx, loop_score,
+            self.keyframe_poses[prev_idx],
+            self.keyframe_poses[curr_idx])
+
+        return result
 
     def _select_keyframes(self):
         """关键帧选择，与 C++ process_pg 中的逻辑一致"""
@@ -1426,6 +1508,10 @@ class OfflineLoopCloser:
         data_dir = self.data_dir
 
         # 将关键帧的优化校正传播到所有（合并后的）帧
+        # 正确做法：odom相对位姿是固定的，把关键帧的校正量通过odom约束传播
+        #   odom_delta = inv(T_orig_kf) @ T_orig_i     (kf→i 的刚性 odom 变换)
+        #   T_opt_i = T_opt_kf @ odom_delta            (在优化后的kf上叠加刚性变换)
+        # 无需插值，因为 odom_delta 本身已在同一 odom 坐标系下定义，几何正确。
         full_optimized_merged = []
         for i, T_orig in enumerate(self.all_poses):
             # 找到当前帧前后的关键帧索引
@@ -1442,51 +1528,27 @@ class OfflineLoopCloser:
             if kf_idx_after is None:
                 kf_idx_after = len(self.keyframe_indices) - 1
 
-            if kf_idx_before == kf_idx_after:
-                # 当前帧前后是同一个关键帧，将该校正量应用到当前帧的原始odom上
-                T_orig_kf = self.keyframe_poses[kf_idx_before]
-                T_corr = np.linalg.inv(T_orig_kf) @ optimized_poses[kf_idx_before]
-                T_opt = T_orig @ T_corr
-            else:
-                # 线性插值权重（按原始帧索引距离）
-                o_before = self.keyframe_indices[kf_idx_before]
-                o_after = self.keyframe_indices[kf_idx_after]
-                weight = (i - o_before) / max(o_after - o_before, 1)
-
-                # 计算两个关键帧各自的校正量
-                T_orig_before = self.keyframe_poses[kf_idx_before]
-                T_orig_after = self.keyframe_poses[kf_idx_after]
-                T_corr_before = np.linalg.inv(T_orig_before) @ optimized_poses[kf_idx_before]
-                T_corr_after = np.linalg.inv(T_orig_after) @ optimized_poses[kf_idx_after]
-
-                # 对平移做线性插值，旋转做球面线性插值（slerp）
-                t_before = T_corr_before[:3, 3]
-                t_after = T_corr_after[:3, 3]
-                t_interp = t_before + weight * (t_after - t_before)
-
-                R_before = T_corr_before[:3, :3]
-                R_after = T_corr_after[:3, :3]
-                R_interp = _interp_rotation_matrix(R_before, R_after, weight)
-
-                T_corr = np.eye(4)
-                T_corr[:3, :3] = R_interp
-                T_corr[:3, 3] = t_interp
-
-                T_opt = T_orig @ T_corr
+            # odom 刚性约束：从关键帧到帧 i 的相对变换
+            T_orig_kf = self.keyframe_poses[kf_idx_before]
+            odom_delta = np.linalg.inv(T_orig_kf) @ T_orig
+            # 在优化后的关键帧位姿上叠加 odom 约束
+            T_opt = optimized_poses[kf_idx_before] @ odom_delta
 
             full_optimized_merged.append(T_opt)
 
         # 如果使用了多帧合并，将校正回推到原始帧
+        # 正确做法：合并帧的参考坐标系是组内最后一帧，odom相对变换固定
+        #   T_opt_orig_i = T_merged_opt @ inv(T_merged_orig) @ T_orig_i
         if self.merge_n > 1 and self.original_poses is not None:
             print(f"  将优化结果回推到 {len(self.original_poses)} 个原始帧...")
             full_optimized = []
             for g, T_merged_opt in enumerate(full_optimized_merged):
-                T_merged_orig = self.all_poses[g]  # 合并帧的原始 odom 位姿
-                T_corr_g = np.linalg.inv(T_merged_orig) @ T_merged_opt
+                T_merged_orig = self.all_poses[g]  # 合并帧的原始 odom 位姿 (组内最后一帧)
 
                 for orig_idx in self.merge_indices[g]:
                     T_orig_i = self.original_poses[orig_idx]
-                    T_opt_i = T_orig_i @ T_corr_g
+                    odom_delta = np.linalg.inv(T_merged_orig) @ T_orig_i
+                    T_opt_i = T_merged_opt @ odom_delta
                     full_optimized.append(T_opt_i)
         else:
             full_optimized = full_optimized_merged

@@ -253,15 +253,16 @@ void initNoises(void) {
   priorNoise = noiseModel::Diagonal::Variances(priorNoiseVector6);
 
   gtsam::Vector odomNoiseVector6(6);
-  // odomNoiseVector6 << 1e-4, 1e-4, 1e-4, 1e-4, 1e-4, 1e-4;
-  odomNoiseVector6 << 1e-6, 1e-6, 1e-6, 1e-4, 1e-4, 1e-4;
+  // sigma平移=0.01m, sigma旋转=0.008rad(≈0.5°) — 坚信odom但不过度
+  odomNoiseVector6 << 1e-4, 1e-4, 1e-4, 6.4e-5, 6.4e-5, 6.4e-5;
   odomNoise = noiseModel::Diagonal::Variances(odomNoiseVector6);
 
-  double loopNoiseScore = 0.5;  // constant is ok...
-  gtsam::Vector robustNoiseVector6(
-      6);  // gtsam::Pose3 factor has 6 elements (6D)
+  // 回环噪声: sigma平移=1m, sigma旋转=0.5rad — 不信任回环
+  double loopNoiseScore = 1.0;  // 平移方差
+  double loopRotNoiseScore = 0.25;  // 旋转方差
+  gtsam::Vector robustNoiseVector6(6);
   robustNoiseVector6 << loopNoiseScore, loopNoiseScore, loopNoiseScore,
-      loopNoiseScore, loopNoiseScore, loopNoiseScore;
+      loopRotNoiseScore, loopRotNoiseScore, loopRotNoiseScore;
   robustLoopNoise = gtsam::noiseModel::Robust::Create(
       gtsam::noiseModel::mEstimator::Huber::Create(
           1.345),  // Huber kernel is more robust than Cauchy for loop closures
@@ -1100,6 +1101,7 @@ void performSCLoopClosure(void) {
     gtsam::Pose3 relative_pose(relative_pose_matrix.cast<double>());
 
     // Use GICP for refinement if enabled
+    bool gicp_success = false;
     if (use_gicp_for_loop_closure) {
       // 检查初始平移是否过大（避免GICP崩溃）
       double init_translation = relative_pose_matrix.block<3, 1>(0, 3).norm();
@@ -1121,13 +1123,20 @@ void performSCLoopClosure(void) {
             gicp_result.fitness_score < gicp_fitness_score_threshold) {
           // Use GICP refined pose
           relative_pose = gtsam::Pose3(gicp_result.transformation.cast<double>());
+          gicp_success = true;
           cout << "[GICP] Refinement successful! Fitness score: " 
                << gicp_result.fitness_score << endl;
         } else {
           cout << "[GICP] Refinement failed or score too high (" 
-               << gicp_result.fitness_score << "), using BTC result" << endl;
+               << gicp_result.fitness_score << "), rejecting loop" << endl;
         }
       }
+    }
+
+    // GICP失败时拒绝回环（BTC原始位姿精度不够）
+    if (use_gicp_for_loop_closure && !gicp_success) {
+      cout << "[BTC Loop] Rejected: GICP refinement failed, BTC pose not accurate enough" << endl;
+      return;
     }
 
     if (validateLoopClosure(prev_node_idx, curr_node_idx, relative_pose)) {

@@ -18,7 +18,7 @@ Super-LIO 离线回环检测工具 (BTC + GICP)
   - loop_pairs.txt       : 检测到的回环对
 
 用法：
-  python3 offline_loop_closure.py --btc-config ../../config/btc_config.yaml --merge-n 10 --debug-btc
+  python3 offline_loop_closure.py --btc-config ../../config/btc_config.yaml --ros2 --ros2-keep-alive --num-threads 4 --merge-n 10  --debug-btc
 """
 
 import os
@@ -103,6 +103,10 @@ def parse_args():
                         help="ROS2 节点名 (默认: offline_loop_closure)")
     parser.add_argument("--ros2-keep-alive", action="store_true",
                         help="处理完成后保持节点运行（便于在 RViz 中查看话题），按 Ctrl+C 退出")
+
+    # 多线程加速
+    parser.add_argument("--num-threads", type=int, default=0,
+                        help="多线程加速的线程数 (默认: 0=自动检测CPU核心数)")
 
     return parser.parse_args()
 
@@ -227,6 +231,7 @@ def _run_offline_loop_closure(args, ros_node):
         odom_direct_threshold=odom_direct_threshold,
         skip_near_num=skip_near_num,  # 新增
         merge_n=args.merge_n,
+        num_threads=args.num_threads,
         ros_node=ros_node
     )
 
