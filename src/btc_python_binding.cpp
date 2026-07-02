@@ -214,6 +214,73 @@ public:
         manager_.AddBtcDescs(btcs_vec, frame_position);
     }
 
+    // AddBtcDescsFromCache - 直接用缓存的BTC描述子数据添加到数据库（跳过点云处理）
+    void AddBtcDescsFromCache(py::list btcs_data_list, py::array_t<double> position_array) {
+        Eigen::Vector3d frame_position(0, 0, 0);
+        if (position_array.size() == 3) {
+            auto buf = position_array.request();
+            double* ptr = static_cast<double*>(buf.ptr);
+            frame_position = Eigen::Vector3d(ptr[0], ptr[1], ptr[2]);
+        }
+
+        std::vector<BTC> btcs_vec;
+        for (auto item : btcs_data_list) {
+            py::dict btc_dict = item.cast<py::dict>();
+            BTC btc;
+
+            // triangle (Eigen::Vector3d)
+            btc.triangle_ = btc_dict["triangle"].cast<Eigen::Vector3d>();
+            btc.center_ = btc_dict["center"].cast<Eigen::Vector3d>();
+            btc.frame_number_ = btc_dict["frame_number"].cast<unsigned short>();
+
+            // BinaryDescriptor A
+            {
+                py::dict bin_A = btc_dict["binary_A"].cast<py::dict>();
+                btc.binary_A_.location_ = bin_A["location"].cast<Eigen::Vector3d>();
+                btc.binary_A_.summary_ = bin_A["summary"].cast<unsigned char>();
+                btc.binary_A_.normal_ = bin_A["normal"].cast<Eigen::Vector3d>();
+                btc.binary_A_.plane_id_ = bin_A["plane_id"].cast<int>();
+                py::list occupy_A = bin_A["occupy_array"].cast<py::list>();
+                btc.binary_A_.occupy_array_.clear();
+                for (auto b : occupy_A) {
+                    btc.binary_A_.occupy_array_.push_back(b.cast<bool>());
+                }
+            }
+
+            // BinaryDescriptor B
+            {
+                py::dict bin_B = btc_dict["binary_B"].cast<py::dict>();
+                btc.binary_B_.location_ = bin_B["location"].cast<Eigen::Vector3d>();
+                btc.binary_B_.summary_ = bin_B["summary"].cast<unsigned char>();
+                btc.binary_B_.normal_ = bin_B["normal"].cast<Eigen::Vector3d>();
+                btc.binary_B_.plane_id_ = bin_B["plane_id"].cast<int>();
+                py::list occupy_B = bin_B["occupy_array"].cast<py::list>();
+                btc.binary_B_.occupy_array_.clear();
+                for (auto b : occupy_B) {
+                    btc.binary_B_.occupy_array_.push_back(b.cast<bool>());
+                }
+            }
+
+            // BinaryDescriptor C
+            {
+                py::dict bin_C = btc_dict["binary_C"].cast<py::dict>();
+                btc.binary_C_.location_ = bin_C["location"].cast<Eigen::Vector3d>();
+                btc.binary_C_.summary_ = bin_C["summary"].cast<unsigned char>();
+                btc.binary_C_.normal_ = bin_C["normal"].cast<Eigen::Vector3d>();
+                btc.binary_C_.plane_id_ = bin_C["plane_id"].cast<int>();
+                py::list occupy_C = bin_C["occupy_array"].cast<py::list>();
+                btc.binary_C_.occupy_array_.clear();
+                for (auto b : occupy_C) {
+                    btc.binary_C_.occupy_array_.push_back(b.cast<bool>());
+                }
+            }
+
+            btcs_vec.push_back(btc);
+        }
+
+        manager_.AddBtcDescs(btcs_vec, frame_position);
+    }
+
     // 获取配置参数
     py::dict GetConfig() {
         py::dict config;
@@ -262,6 +329,9 @@ PYBIND11_MODULE(btc_cpp, m) {
              "Add BTC descriptors to database",
              py::arg("cloud"), py::arg("frame_id"),
              py::arg("position") = py::array_t<double>(3))
+        .def("AddBtcDescsFromCache", &PyBtcDescManager::AddBtcDescsFromCache,
+             "Add pre-computed BTC descriptors directly from cache (skip cloud processing)",
+             py::arg("btcs_data_list"), py::arg("position"))
         .def("GetConfig", &PyBtcDescManager::GetConfig,
              "Get BTC configuration parameters")
         .def("GetDatabaseSize", &PyBtcDescManager::GetDatabaseSize,

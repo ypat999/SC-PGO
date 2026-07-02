@@ -559,7 +559,9 @@ class OfflineLoopCloser:
         self.use_method = use_method  # 回环检测方法选择
         # 多线程参数: 0=自动检测CPU核心数
         self.num_threads = num_threads if num_threads > 0 else os.cpu_count() or 4
-        self._btc_lock = threading.Lock()  # 保护C++ BTC数据库的线程安全
+        self._btc_lock = threading.Lock()  # 保护C++ BTC数据库的线程安全（仅 BTC/SC 模式需要）
+
+        self.btc_config_file = btc_config_file  # 缓存参数对比用
 
         # BTC C++ 模块
         if HAS_BTC_CPP and use_method == 'btc':
@@ -594,7 +596,13 @@ class OfflineLoopCloser:
             if use_method == 'sc':
                 print("[ScanContext] ⚠ C++ 模块未安装，无法使用ScanContext方法")
 
-        self.btc_manager = self.btc_cpp  # 统一接口
+        # odom_only 模式：不使用 BTC/SC，只根据 Odom 直接验证
+        if use_method == 'odom_only':
+            self.btc_cpp = None
+            self.sc_cpp = None
+            print("[Odom Only] ✓ 仅使用 Odom 距离进行 GICP 验证，不使用 BTC/SC")
+
+        self.btc_manager = self.btc_cpp  # 统一接口（仅 BTC 模式使用）
         self.btc_config = None  # Python不再需要BTC配置对象
 
         # 回环验证参数
@@ -656,7 +664,129 @@ class OfflineLoopCloser:
                     RosPath, 'optimized_path', qos)
                 self._ros_pub_loop_markers = ros_node.create_publisher(
                     RosMarkerArray, 'loop_match_markers', qos)
+                self._ros_pub_current_odom = ros_node.create_publisher(
+                    RosOdometry, 'loop_closure_progress', 10)
                 print("[ROS2] 离线回环可视化已启用: odom_keyframe_path / optimized_path / loop_match_markers")
+                print("[ROS2]   进度跟踪: loop_closure_progress (Odometry)")
+
+    # ======================== BTC 缓存 ========================
+
+    def _btc_cache_dir(self):
+        """BTC 缓存目录"""
+        return os.path.join(self.data_dir, "BTC_CACHE")
+
+    def _btc_cache_params(self):
+        """收集影响 BTC 生成的所有参数，用于判断缓存是否有效"""
+        params = {
+            'merge_n': self.merge_n,
+            'keyframe_meter_gap': self.keyframe_meter_gap,
+            'keyframe_deg_gap': self.keyframe_deg_gap,
+            'scan_ds_size': self.scan_ds_size,
+        }
+        if self.btc_config_file and os.path.exists(self.btc_config_file):
+            try:
+                with open(self.btc_config_file, 'r') as f:
+                    params['btc_config_content'] = f.read()
+            except Exception:
+                pass
+        poses_file = os.path.join(self.data_dir, "odom_poses.txt")
+        if os.path.exists(poses_file):
+            params['poses_mtime'] = os.path.getmtime(poses_file)
+        return params
+
+    def _btc_cache_params_match(self):
+        """与缓存的参数对比，返回 True 表示匹配"""
+        import pickle, json
+        params_file = os.path.join(self._btc_cache_dir(), "params.json")
+        if not os.path.exists(params_file):
+            return False
+        try:
+            with open(params_file, 'r') as f:
+                saved = json.load(f)
+        except Exception:
+            return False
+
+        current = self._btc_cache_params()
+        # 把 btc_config_content 从 params 中排除（JSON中不存大文本）
+        # 其他关键参数逐项对比
+        for key in ['merge_n', 'keyframe_meter_gap', 'keyframe_deg_gap', 'scan_ds_size']:
+            if saved.get(key) != current.get(key):
+                print(f"[Cache] 参数不匹配 ({key}): saved={saved.get(key)}, current={current.get(key)}")
+                return False
+        if saved.get('poses_mtime') != current.get('poses_mtime'):
+            print("[Cache] 位姿文件已更新")
+            return False
+        return True
+
+    def _btc_cache_save_params(self):
+        """保存当前参数到 params.json"""
+        import json
+        cache_dir = self._btc_cache_dir()
+        os.makedirs(cache_dir, exist_ok=True)
+        params = self._btc_cache_params()
+        # 不保存 btc_config_content（可能很大）
+        del params['btc_config_content']
+        with open(os.path.join(cache_dir, "params.json"), 'w') as f:
+            json.dump(params, f)
+
+    def _btc_cache_frame_path(self, frame_idx):
+        """单帧BTC缓存文件路径"""
+        return os.path.join(self._btc_cache_dir(), f"{frame_idx:06d}.btc")
+
+    def _btc_cache_clear(self):
+        """清除旧的缓存文件"""
+        import shutil
+        cache_dir = self._btc_cache_dir()
+        if os.path.isdir(cache_dir):
+            shutil.rmtree(cache_dir)
+        os.makedirs(cache_dir, exist_ok=True)
+
+    def _try_load_btc_cache(self, total_frames):
+        """尝试从缓存加载 BTC 描述子。
+        返回 (loaded_set: set[int], reason: str)。
+        loaded_set 中已完成的帧索引，未完成的帧需要重新生成。
+        """
+        if self.btc_manager is None:
+            return set(), "btc_manager is None"
+
+        import pickle
+        cache_dir = self._btc_cache_dir()
+
+        # 检查参数是否匹配
+        if not self._btc_cache_params_match():
+            # 参数变了，清除全部旧缓存
+            self._btc_cache_clear()
+            self._btc_cache_save_params()
+            return set(), "参数已变更，清除旧缓存"
+
+        # 参数匹配，扫描已有的帧缓存
+        loaded = set()
+        total_btcs = 0
+        for i in range(total_frames):
+            fpath = self._btc_cache_frame_path(i)
+            if os.path.exists(fpath):
+                try:
+                    with open(fpath, 'rb') as f:
+                        item = pickle.load(f)
+                    btcs = item.get('btcs_data', [])
+                    position = np.array(item.get('frame_position', [0, 0, 0]), dtype=np.float64)
+                    if btcs:
+                        self.btc_manager.AddBtcDescsFromCache(btcs, position)
+                        total_btcs += len(btcs)
+                    loaded.add(i)
+                except Exception as e:
+                    print(f"[Cache] 帧 {i} 缓存损坏: {e}, 将重新生成")
+
+        missing = total_frames - len(loaded)
+        if missing == 0:
+            print(f"[Cache] ✓ 全部 {len(loaded)} 帧已加载 ({total_btcs} 个 BTC)")
+        elif len(loaded) > 0:
+            print(f"[Cache] 已加载 {len(loaded)}/{total_frames} 帧 ({total_btcs} 个 BTC), "
+                  f"剩余 {missing} 帧需要生成")
+        else:
+            print(f"[Cache] 无有效缓存, {total_frames} 帧需要生成")
+
+        return loaded, ""
 
     def load_data(self, data_dir=None):
         """加载位姿和点云数据"""
@@ -670,6 +800,11 @@ class OfflineLoopCloser:
 
         self.all_poses = self._load_poses_kitti(poses_file)
         print(f"[Load] 加载了 {len(self.all_poses)} 个位姿")
+
+        # 如果合并缓存命中，跳过原始点云加载（_merge_frames 会直接从缓存加载）
+        if self.merge_n > 1 and self._merge_cache_hit():
+            self.all_scans = []  # _merge_frames 会填充
+            return True
 
         # 加载点云
         scans_dir = os.path.join(data_dir, "Scans")
@@ -690,6 +825,19 @@ class OfflineLoopCloser:
         print(f"[Load] 加载了 {len(self.all_scans)} 帧点云")
         return True
 
+    def _merge_cache_hit(self):
+        """检查合并缓存是否存在且数量匹配"""
+        n = self.merge_n
+        total = len(self.all_poses)
+        num_groups = (total + n - 1) // n
+        merged_dir = os.path.join(self.data_dir, "MergedScans")
+        merged_poses_path = os.path.join(self.data_dir, "merged_odom_poses.txt")
+        if not os.path.isdir(merged_dir) or not os.path.exists(merged_poses_path):
+            return False
+        existing_pcds = sorted([f for f in os.listdir(merged_dir) if f.endswith('.pcd')])
+        cached_poses = self._load_poses_kitti(merged_poses_path)
+        return len(existing_pcds) == num_groups and len(cached_poses) == num_groups
+
     def _merge_frames(self):
         """
         将每 merge_n 帧合并为一帧（针对点云稀疏雷达如 Mid360）。
@@ -702,6 +850,46 @@ class OfflineLoopCloser:
 
         n = self.merge_n
         total = len(self.all_poses)
+        num_groups = (total + n - 1) // n
+
+        print(f"\n===== 多帧合并 (每{n}帧→1帧) =====")
+        print(f"  原始帧数: {total}, 合并组数: {num_groups}")
+
+        # 检查是否已有缓存的合并结果
+        merged_dir = os.path.join(self.data_dir, "MergedScans")
+        merged_poses_path = os.path.join(self.data_dir, "merged_odom_poses.txt")
+        if os.path.isdir(merged_dir) and os.path.exists(merged_poses_path):
+            # 统计 MergedScans 下的 pcd 数量
+            existing_pcds = sorted([
+                f for f in os.listdir(merged_dir) if f.endswith('.pcd')
+            ])
+            cached_poses = self._load_poses_kitti(merged_poses_path)
+            if len(existing_pcds) == num_groups and len(cached_poses) == num_groups:
+                print(f"[Cache] 合并结果缓存命中: {len(existing_pcds)} 帧, 直接加载")
+                self.original_poses = [T.copy() for T in self.all_poses]
+                self.original_scans = list(self.all_scans)
+                self.merge_indices = [
+                    list(range(g * n, min((g + 1) * n, total)))
+                    for g in range(num_groups)
+                ]
+                self.all_poses = cached_poses
+                self.all_scans = []
+                # 固定输出 10 次进度，均匀分布
+                progress_interval = max(1, num_groups // 10)
+                progress_indices = set(range(0, num_groups, progress_interval))
+                # 确保包含最后一帧
+                if num_groups > 1:
+                    progress_indices.add(num_groups - 1)
+                for g in range(num_groups):
+                    pcd_path = os.path.join(merged_dir, existing_pcds[g])
+                    pts = self._load_pcd(pcd_path)
+                    self.all_scans.append(pts)
+                    if g in progress_indices:
+                        print(f"  加载合并帧 {g:4d}/{num_groups}: {len(pts)} pts")
+                return
+            else:
+                print(f"[Cache] 合并结果数量不匹配 (缓存={len(existing_pcds)}/{len(cached_poses)}, "
+                      f"需要={num_groups}), 重新合并")
 
         # 备份原始数据
         self.original_poses = [T.copy() for T in self.all_poses]
@@ -710,10 +898,6 @@ class OfflineLoopCloser:
         merged_poses = []
         merged_scans = []
         self.merge_indices = []
-
-        num_groups = (total + n - 1) // n
-        print(f"\n===== 多帧合并 (每{n}帧→1帧) =====")
-        print(f"  原始帧数: {total}, 合并组数: {num_groups}")
 
         for g in range(num_groups):
             start = g * n
@@ -923,6 +1107,48 @@ class OfflineLoopCloser:
         import rclpy
         rclpy.spin_once(self.ros_node, timeout_sec=0.0)
 
+    def _ros_publish_current_odom(self, frame_idx, total_frames):
+        """
+        发布当前处理帧的 odometry 到 loop_closure_progress 话题。
+
+        frame_idx: int, 当前帧索引
+        total_frames: int, 关键帧总数
+        """
+        if self.ros_node is None or not HAS_ROS2 or self._ros_pub_current_odom is None:
+            return
+        T = self.keyframe_poses[frame_idx]
+        odom = RosOdometry()
+        odom.header.frame_id = 'odom'
+        odom.header.stamp = self.ros_node.get_clock().now().to_msg()
+        # 利用 child_frame_id 传递进度信息，方便 RViz 显示
+        odom.child_frame_id = f'{frame_idx}/{total_frames}'
+
+        t = T[:3, 3]
+        odom.pose.pose.position.x = float(t[0])
+        odom.pose.pose.position.y = float(t[1])
+        odom.pose.pose.position.z = float(t[2])
+
+        # 4x4 -> quaternion
+        R = T[:3, :3]
+        qw = np.sqrt(max(0, 1 + R[0,0] + R[1,1] + R[2,2])) / 2
+        qx = np.sqrt(max(0, 1 + R[0,0] - R[1,1] - R[2,2])) / 2
+        qy = np.sqrt(max(0, 1 - R[0,0] + R[1,1] - R[2,2])) / 2
+        qz = np.sqrt(max(0, 1 - R[0,0] - R[1,1] + R[2,2])) / 2
+        # 取符号
+        if R[2,1] - R[1,2] < 0: qx = -qx
+        if R[0,2] - R[2,0] < 0: qy = -qy
+        if R[1,0] - R[0,1] < 0: qz = -qz
+
+        odom.pose.pose.orientation.x = float(qx)
+        odom.pose.pose.orientation.y = float(qy)
+        odom.pose.pose.orientation.z = float(qz)
+        odom.pose.pose.orientation.w = float(qw)
+
+        # 速度场留空，pose covariance 保留默认（全零）
+        self._ros_pub_current_odom.publish(odom)
+        import rclpy
+        rclpy.spin_once(self.ros_node, timeout_sec=0.0)
+
     def run(self):
         """执行完整的离线回环流程"""
         if not hasattr(self, 'all_poses'):
@@ -946,52 +1172,80 @@ class OfflineLoopCloser:
         # 发布原始 odom 关键帧轨迹（PGO 输入），用于在 RViz 中与优化结果对比
         self._ros_publish_path(self.keyframe_poses, self._ros_pub_odom_path)
 
-        # ===== 步骤 2: BTC 描述子生成 + 数据库构建 (多线程加速) =====
-        print("\n===== 步骤 2: BTC 描述子生成 (多线程加速) =====")
-        print(f"  线程数: {self.num_threads}")
-        total_btcs = 0
-        zero_btc_frames = 0
+        # ===== 步骤 2: BTC 描述子生成 + 数据库构建 =====
+        print("\n===== 步骤 2: BTC 描述子生成 =====")
         step2_total = len(self.keyframe_clouds)
-        step2_done = 0
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.num_threads) as executor:
-            futures = {
-                executor.submit(self._process_frame_step2, i): i
-                for i in range(step2_total)
-            }
+        # 尝试从缓存加载已有帧
+        loaded_set, reason = self._try_load_btc_cache(step2_total)
+        if reason:
+            print(f"  [Cache] {reason}")
 
-            for future in concurrent.futures.as_completed(futures):
-                i = futures[future]
-                try:
-                    frame_result = future.result()
-                except Exception as e:
-                    print(f"  [ERROR] 关键帧 {i} BTC生成异常: {e}")
-                    continue
+        # 确保 params.json 存在
+        cache_dir = self._btc_cache_dir()
+        params_file = os.path.join(cache_dir, "params.json")
+        if not os.path.exists(params_file):
+            self._btc_cache_save_params()
 
-                if frame_result is None:
-                    continue
+        # 确定需要生成的帧
+        to_generate = [i for i in range(step2_total) if i not in loaded_set]
+        already_done = len(loaded_set)
 
-                step2_done += 1
-                total_btcs += frame_result['num_btcs']
+        if not to_generate:
+            print(f"  全部 {step2_total} 帧已缓存，跳过生成")
+        else:
+            print(f"  需要生成: {len(to_generate)} 帧, 已缓存: {already_done} 帧")
+            print(f"  线程数: {self.num_threads}")
 
-                if frame_result['num_btcs'] == 0:
-                    zero_btc_frames += 1
+            import pickle
+            zero_btc_frames = 0
+            done_count = 0
 
-                if not frame_result['success']:
-                    if zero_btc_frames <= 5 or i == step2_total - 1:
-                        print(f"  [WARN] 关键帧 {i}: {frame_result.get('error', '失败')}")
-                elif frame_result['num_btcs'] == 0:
-                    if zero_btc_frames <= 5 or i == step2_total - 1:
-                        print(f"  [WARN] 关键帧 {i} 点数={frame_result['n_pts']}, BTC=0, 跳过")
-                elif step2_done % 20 == 0 or i == step2_total - 1 or step2_done <= 5:
-                    print(f"  关键帧 {i}/{step2_total} | 点云: {frame_result['n_pts']} pts | BTC: {frame_result['num_btcs']} | 累计: {total_btcs}")
-        
-        # Step 2 汇总
-        print(f"\n  ----- Step 2 汇总 -----")
-        print(f"  总关键帧: {len(self.keyframe_clouds)}, 有效帧: {len(self.keyframe_clouds) - zero_btc_frames}")
-        print(f"  总BTC描述子: {total_btcs}, 零BTC帧数: {zero_btc_frames}")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=self.num_threads) as executor:
+                futures = {
+                    executor.submit(self._process_frame_step2, i): i
+                    for i in to_generate
+                }
+
+                for future in concurrent.futures.as_completed(futures):
+                    i = futures[future]
+                    try:
+                        frame_result = future.result()
+                    except Exception as e:
+                        print(f"  [ERROR] 关键帧 {i} BTC生成异常: {e}")
+                        continue
+
+                    if frame_result is None:
+                        continue
+
+                    # 生成立即写入单帧缓存文件
+                    if frame_result.get('btcs_data'):
+                        fpath = self._btc_cache_frame_path(i)
+                        with open(fpath, 'wb') as f:
+                            save_item = {
+                                'btcs_data': frame_result['btcs_data'],
+                                'frame_position': frame_result['frame_position'],
+                            }
+                            pickle.dump(save_item, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+                    done_count += 1
+                    n_btcs = frame_result['num_btcs']
+
+                    if n_btcs == 0:
+                        zero_btc_frames += 1
+
+                    if not frame_result['success']:
+                        if zero_btc_frames <= 5 or done_count >= len(to_generate):
+                            print(f"  [WARN] 关键帧 {i}/{step2_total}: {frame_result.get('error', '失败')}")
+                    elif n_btcs == 0:
+                        if zero_btc_frames <= 5 or done_count >= len(to_generate):
+                            print(f"  [WARN] 关键帧 {i}/{step2_total} 点数={frame_result['n_pts']}, BTC=0")
+                    elif done_count % 20 == 0 or done_count >= len(to_generate) or done_count <= 5:
+                        print(f"  关键帧 {i}/{step2_total} | 点云: {frame_result['n_pts']} pts | "
+                              f"BTC: {n_btcs} | 进度: {done_count}/{len(to_generate)}")
+
         db_size = self.btc_manager.GetDatabaseSize() if hasattr(self.btc_manager, 'GetDatabaseSize') else 'N/A'
-        print(f"  数据库大小: {db_size}")
+        print(f"\n  数据库大小: {db_size}, 总帧: {step2_total}")
 
         # ===== 步骤 3: 回环检测 + GICP 精化 + 验证 =====
         print("\n===== 步骤 3: 回环检测 (多线程加速) =====")
@@ -1020,6 +1274,9 @@ class OfflineLoopCloser:
 
                 if frame_result is None:
                     continue
+
+                # 每帧处理完立即发布当前 odom，便于在 RViz 中追踪进度和位置
+                self._ros_publish_current_odom(i, len(self.keyframe_clouds))
 
                 # ==== 在主线程中安全地更新共享状态 ====
                 if frame_result.get('no_btc'):
@@ -1104,13 +1361,23 @@ class OfflineLoopCloser:
             pose = self.keyframe_poses[i]
             frame_position = pose[:3, 3]
 
-            # C++ 数据库操作需要加锁
+            # 只调用一次 GenerateBtcDescs，拿到 BTC 数据后立即释放点云的 numpy 引用
             with self._btc_lock:
-                self.btc_manager.AddBtcDescs(cloud_with_intensity, i, frame_position)
                 btc_result = self.btc_manager.GenerateBtcDescs(cloud_with_intensity, i)
                 num_btcs = btc_result['num_btcs']
+                btcs_data = btc_result.get('btcs_data', [])
+
+                # 将生成的 BTC 描述子添加到数据库（用 AddBtcDescsFromCache 跳过重复生成）
+                if btcs_data:
+                    self.btc_manager.AddBtcDescsFromCache(btcs_data, np.array(frame_position, dtype=np.float64))
+
+            # 尽早释放 cloud_with_intensity 和 btc_result（仅保留必要的 btcs_data）
+            del cloud_with_intensity
+            del btc_result
 
             result['num_btcs'] = num_btcs
+            result['btcs_data'] = btcs_data
+            result['frame_position'] = frame_position.tolist()
             result['success'] = True
 
         except Exception as e:
@@ -1222,15 +1489,34 @@ class OfflineLoopCloser:
                             self.keyframe_poses[i])
                         return result
 
-        # ===== BTC匹配流程 =====
-        if cloud.shape[1] == 3:
-            cloud_with_intensity = np.hstack([cloud, np.zeros((len(cloud), 1))])
-        else:
-            cloud_with_intensity = cloud
+        # odom_only 模式：只使用 Odom 直接验证，跳过 BTC/SC 搜索
+        if self.use_method == 'odom_only':
+            return result
 
-        with self._btc_lock:
-            btc_result = self.btc_manager.GenerateBtcDescs(cloud_with_intensity, i)
-            num_btcs = btc_result['num_btcs']
+        # ===== BTC匹配流程 =====
+        # 从缓存加载 BTC 描述子（避免重复生成，消除 _btc_lock 瓶颈）
+        cache_file = self._btc_cache_frame_path(i)
+        if os.path.exists(cache_file):
+            import pickle
+            with open(cache_file, 'rb') as f:
+                cache_data = pickle.load(f)
+                btcs_data = cache_data['btcs_data']
+                frame_position_np = np.array(cache_data['frame_position'], dtype=np.float64)
+                num_btcs = len(btcs_data)
+
+            with self._btc_lock:
+                self.btc_manager.AddBtcDescsFromCache(btcs_data, frame_position_np)
+        else:
+            # 缓存不存在时回退到原方式（理论上不应该发生）
+            print(f"  [WARN] 帧 {i} BTC 缓存不存在，回退到重新生成")
+            if cloud.shape[1] == 3:
+                cloud_with_intensity = np.hstack([cloud, np.zeros((len(cloud), 1))])
+            else:
+                cloud_with_intensity = cloud
+
+            with self._btc_lock:
+                btc_result = self.btc_manager.GenerateBtcDescs(cloud_with_intensity, i)
+                num_btcs = btc_result['num_btcs']
 
         if num_btcs == 0:
             result['no_btc'] = True
@@ -1241,7 +1527,13 @@ class OfflineLoopCloser:
         if i % 50 == 0 or i == total_kf - 1:
             print(f"  [Step3] 帧 {i}/{total_kf} | 点云 {len(cloud)} pts | BTC={num_btcs}, 搜索中...")
 
-        # C++ SearchLoop
+        # C++ SearchLoop（仍需 _btc_lock，但时间占比大幅降低）
+        # SearchLoop 需要当前帧的点云来计算候选描述子，所以这里仍需点云
+        if cloud.shape[1] == 3:
+            cloud_with_intensity = np.hstack([cloud, np.zeros((len(cloud), 1))])
+        else:
+            cloud_with_intensity = cloud
+
         with self._btc_lock:
             search_result = self.btc_manager.SearchLoop(cloud_with_intensity, i, current_position)
         match_frame_id = search_result['match_frame_id']
@@ -1383,12 +1675,46 @@ class OfflineLoopCloser:
 
     def _select_keyframes(self):
         """关键帧选择，与 C++ process_pg 中的逻辑一致"""
-        self.keyframe_clouds = []
-        self.keyframe_clouds_ds = []
-        self.keyframe_poses = []
-        self.keyframe_poses6d = []
-        self.keyframe_indices = []  # 记录每个关键帧对应原始帧的索引
+        # 尝试从缓存加载关键帧索引
+        import json
+        kf_cache_file = os.path.join(self._btc_cache_dir(), "keyframes.json")
+        kf_cache = None
+        if os.path.exists(kf_cache_file):
+            try:
+                with open(kf_cache_file, 'r') as f:
+                    kf_cache = json.load(f)
+            except Exception:
+                pass
 
+        if (kf_cache and
+                kf_cache.get('total_frames') == len(self.all_poses) and
+                kf_cache.get('meter_gap') == self.keyframe_meter_gap and
+                kf_cache.get('deg_gap') == self.keyframe_deg_gap and
+                isinstance(kf_cache.get('indices'), list)):
+            print(f"[Cache] 关键帧缓存命中: {len(kf_cache['indices'])} 帧 ({len(self.all_poses)} merged 帧)")
+            kf_indices = kf_cache['indices']
+        else:
+            kf_indices = self._compute_keyframe_indices()
+
+            # 写入缓存
+            cache_dir = self._btc_cache_dir()
+            os.makedirs(cache_dir, exist_ok=True)
+            kf_data = {
+                'total_frames': len(self.all_poses),
+                'meter_gap': self.keyframe_meter_gap,
+                'deg_gap': self.keyframe_deg_gap,
+                'indices': kf_indices,
+            }
+            with open(kf_cache_file, 'w') as f:
+                json.dump(kf_data, f)
+            print(f"[Cache] 关键帧缓存已保存: {kf_cache_file} ({len(kf_indices)} 帧)")
+
+        # 根据索引构建关键帧数据结构（从 merged all_poses/all_scans）
+        self._build_keyframes_from_indices(kf_indices)
+
+    def _compute_keyframe_indices(self):
+        """计算关键帧索引列表"""
+        indices = []
         translation_accumulated = float('inf')
         rotation_accumulated = float('inf')
         prev_pose6d = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
@@ -1397,7 +1723,6 @@ class OfflineLoopCloser:
             T = self.all_poses[i]
             pose6d = self._matrix_to_pose6d(T)
 
-            # 计算增量
             T_prev = _pose6d_to_matrix(prev_pose6d)
             T_curr = _pose6d_to_matrix(pose6d)
             T_delta = np.linalg.inv(T_prev) @ T_curr
@@ -1419,22 +1744,35 @@ class OfflineLoopCloser:
             if is_key_frame or i == 0:
                 translation_accumulated = 0.0
                 rotation_accumulated = 0.0
-
-                # 保存原始点云 (BTC 使用) 和下采样点云 (GICP 使用)
-                # 对应 C++ 中 keyframeLaserClouds 存储的是 downSizeFilterScancontext 后的完整帧
-                cloud = self.all_scans[i]
-                if len(cloud) > 0:
-                    cloud_ds = down_sampling_voxel(cloud, self.scan_ds_size)
-                else:
-                    cloud_ds = cloud
-
-                self.keyframe_clouds.append(cloud)       # BTC 用原始点云
-                self.keyframe_clouds_ds.append(cloud_ds)  # GICP 用下采样点云
-                self.keyframe_poses.append(T.copy())
-                self.keyframe_poses6d.append(pose6d)
-                self.keyframe_indices.append(i)  # 记录原始帧索引
+                indices.append(i)
 
             prev_pose6d = pose6d
+
+        return indices
+
+    def _build_keyframes_from_indices(self, kf_indices):
+        """根据索引从 merged all_poses/all_scans 构建关键帧数据结构"""
+        self.keyframe_clouds = []
+        self.keyframe_clouds_ds = []
+        self.keyframe_poses = []
+        self.keyframe_poses6d = []
+        self.keyframe_indices = []
+
+        for i in kf_indices:
+            T = self.all_poses[i]
+            pose6d = self._matrix_to_pose6d(T)
+            cloud = self.all_scans[i]
+
+            if len(cloud) > 0:
+                cloud_ds = down_sampling_voxel(cloud, self.scan_ds_size)
+            else:
+                cloud_ds = cloud
+
+            self.keyframe_clouds.append(cloud)       # BTC 用原始点云
+            self.keyframe_clouds_ds.append(cloud_ds)  # GICP 用下采样点云
+            self.keyframe_poses.append(T.copy())
+            self.keyframe_poses6d.append(pose6d)
+            self.keyframe_indices.append(i)
 
     def _optimize_pose_graph(self, loop_constraints):
         """

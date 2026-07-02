@@ -39,7 +39,8 @@ scancontext:
   # use_method: 回环检测方法选择
   #   - 'btc': 使用BTC (Binary Triangle Context) - 基于平面特征，精度高
   #   - 'sc': 使用ScanContext - 基于全局点云描述子，召回率高
-  use_method: btc
+  #   - 'odom_only': 只根据Odom距离进行直接GICP验证，不使用BTC/SC
+  use_method: odom_only
 
   # ScanContext 参数 (仅当 use_method='sc' 时生效)
   # sc_dist_thres: ScanContext距离阈值
