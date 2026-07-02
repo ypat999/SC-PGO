@@ -560,6 +560,7 @@ class OfflineLoopCloser:
         # 多线程参数: 0=自动检测CPU核心数
         self.num_threads = num_threads if num_threads > 0 else os.cpu_count() or 4
         self._btc_lock = threading.Lock()  # 保护C++ BTC数据库的线程安全（仅 BTC/SC 模式需要）
+        self._ros_publish_lock = threading.Lock()  # 保护ROS2发布操作的线程安全（避免 rclpy.spin_once 冲突）
 
         self.btc_config_file = btc_config_file  # 缓存参数对比用
 
@@ -1016,9 +1017,10 @@ class OfflineLoopCloser:
         for T in poses_list:
             msg.poses.append(self._matrix_to_pose_stamped(T, frame_id))
         publisher.publish(msg)
-        # 强制刷新确保消息发到wire
+        # 强制刷新确保消息发到wire（用锁避免多线程 rclpy.spin_once 冲突）
         import rclpy
-        rclpy.spin_once(self.ros_node, timeout_sec=0.0)
+        with self._ros_publish_lock:
+            rclpy.spin_once(self.ros_node, timeout_sec=0.0)
 
     def _ros_publish_loop_markers(self, prev_idx, curr_idx, score,
                                   pose_prev, pose_curr, frame_id='odom'):
@@ -1104,8 +1106,10 @@ class OfflineLoopCloser:
 
         self._ros_pub_loop_markers.publish(marker_array)
         # 强制刷新确保消息发到wire（rclpy publish() 是异步入队，需spin_once触发发送）
+        # 用锁避免多线程 rclpy.spin_once 冲突
         import rclpy
-        rclpy.spin_once(self.ros_node, timeout_sec=0.0)
+        with self._ros_publish_lock:
+            rclpy.spin_once(self.ros_node, timeout_sec=0.0)
 
     def _ros_publish_current_odom(self, frame_idx, total_frames):
         """
@@ -1147,7 +1151,8 @@ class OfflineLoopCloser:
         # 速度场留空，pose covariance 保留默认（全零）
         self._ros_pub_current_odom.publish(odom)
         import rclpy
-        rclpy.spin_once(self.ros_node, timeout_sec=0.0)
+        with self._ros_publish_lock:
+            rclpy.spin_once(self.ros_node, timeout_sec=0.0)
 
     def run(self):
         """执行完整的离线回环流程"""
@@ -1171,6 +1176,16 @@ class OfflineLoopCloser:
 
         # 发布原始 odom 关键帧轨迹（PGO 输入），用于在 RViz 中与优化结果对比
         self._ros_publish_path(self.keyframe_poses, self._ros_pub_odom_path)
+
+        # ===== 预计算关键帧距离矩阵（优化 Step 3 Odom扫描）=====
+        print("\n===== 预计算距离矩阵 =====")
+        num_kf = len(self.keyframe_poses)
+        positions = np.array([pose[:3, 3] for pose in self.keyframe_poses])  # N x 3
+        # 完全向量化计算距离矩阵：利用广播计算所有帧对距离
+        # positions[:, None, :] - positions[None, :, :] -> N x N x 3
+        diff = positions[:, None, :] - positions[None, :, :]
+        self.keyframe_distance_matrix = np.linalg.norm(diff, axis=2).astype(np.float32)
+        print(f"  距离矩阵 {num_kf}x{num_kf} 已预计算完成")
 
         # ===== 步骤 2: BTC 描述子生成 + 数据库构建 =====
         print("\n===== 步骤 2: BTC 描述子生成 =====")
@@ -1257,11 +1272,12 @@ class OfflineLoopCloser:
         odom_direct_verify_count = 0
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.num_threads) as executor:
-            # 提交所有帧到线程池
-            futures = {
-                executor.submit(self._process_frame_step3, i): i
-                for i in range(len(self.keyframe_clouds))
-            }
+            # 提交所有帧到线程池，提交时立即发布 odom 进度（线性显示）
+            futures = {}
+            for i in range(len(self.keyframe_clouds)):
+                # 提交前发布 odom，RViz 显示线性进度
+                self._ros_publish_current_odom(i, len(self.keyframe_clouds))
+                futures[executor.submit(self._process_frame_step3, i)] = i
 
             # 收集结果
             for future in concurrent.futures.as_completed(futures):
@@ -1274,9 +1290,6 @@ class OfflineLoopCloser:
 
                 if frame_result is None:
                     continue
-
-                # 每帧处理完立即发布当前 odom，便于在 RViz 中追踪进度和位置
-                self._ros_publish_current_odom(i, len(self.keyframe_clouds))
 
                 # ==== 在主线程中安全地更新共享状态 ====
                 if frame_result.get('no_btc'):
@@ -1420,18 +1433,15 @@ class OfflineLoopCloser:
         pose = self.keyframe_poses[i]
         current_position = pose[:3, 3]
 
-        # ===== Odom距离直接验证 =====
+        # ===== Odom距离直接验证（查表优化）=====
         odom_direct_candidates = []
         skip_near_num = self.skip_near_num
-        for j in range(len(self.keyframe_clouds)):
-            if j >= i:
-                continue
+        # 直接从距离矩阵查表获取所有历史帧的距离
+        distances = self.keyframe_distance_matrix[i, :i]  # 0 到 i-1 的距离
+        for j, odom_distance in enumerate(distances):
             frame_diff = i - j
             if frame_diff <= skip_near_num:
                 continue
-            prev_pose = self.keyframe_poses[j]
-            prev_position = prev_pose[:3, 3]
-            odom_distance = np.linalg.norm(current_position - prev_position)
             if odom_distance < self.odom_direct_threshold:
                 odom_direct_candidates.append((j, odom_distance))
 
@@ -1457,37 +1467,31 @@ class OfflineLoopCloser:
 
                 if (gicp_result and gicp_result.has_converged and
                         gicp_result.fitness_score < self.gicp_config.fitness_score_threshold):
-                    is_degenerate, deg_dir, eigvals = check_degeneracy(
-                        self.keyframe_clouds_ds[i],
-                        self.keyframe_clouds_ds[candidate_id],
-                        gicp_result.transformation,
-                        max_correspondence_distance=self.gicp_config.max_correspondence_distance
+                    # 跳过 Degeneracy 检查（加速优化）
+                    print(f"  [Odom Direct SUCCESS] 回环验证成功! "
+                          f"{candidate_id} <-> {i}, GICP fitness: {gicp_result.fitness_score:.4f}")
+                    result['odom_direct'] = True
+                    result['loop_found'] = True
+                    T_delta = gicp_result.transformation
+                    t_vec = T_delta[:3, 3]
+                    roll, pitch, yaw = _extract_rpy(T_delta)
+                    result['constraint'] = (
+                        candidate_id, i, gicp_result.transformation, 0.0, 'odom_direct'
                     )
-                    if not is_degenerate:
-                        print(f"  [Odom Direct SUCCESS] 回环验证成功! "
-                              f"{candidate_id} <-> {i}, GICP fitness: {gicp_result.fitness_score:.4f}")
-                        result['odom_direct'] = True
-                        result['loop_found'] = True
-                        T_delta = gicp_result.transformation
-                        t_vec = T_delta[:3, 3]
-                        roll, pitch, yaw = _extract_rpy(T_delta)
-                        result['constraint'] = (
-                            candidate_id, i, gicp_result.transformation, 0.0, 'odom_direct'
-                        )
-                        result['loop_pair'] = (
-                            candidate_id, i,
-                            f"{self.keyframe_indices[candidate_id]:06d}.pcd",
-                            f"{self.keyframe_indices[i]:06d}.pcd",
-                            0.0, gicp_result.fitness_score,
-                            t_vec[0], t_vec[1], t_vec[2],
-                            roll, pitch, yaw
-                        )
-                        # 找到回环立即发布到 RViz
-                        self._ros_publish_loop_markers(
-                            candidate_id, i, gicp_result.fitness_score,
-                            self.keyframe_poses[candidate_id],
-                            self.keyframe_poses[i])
-                        return result
+                    result['loop_pair'] = (
+                        candidate_id, i,
+                        f"{self.keyframe_indices[candidate_id]:06d}.pcd",
+                        f"{self.keyframe_indices[i]:06d}.pcd",
+                        0.0, gicp_result.fitness_score,
+                        t_vec[0], t_vec[1], t_vec[2],
+                        roll, pitch, yaw
+                    )
+                    # 找到回环立即发布到 RViz
+                    self._ros_publish_loop_markers(
+                        candidate_id, i, gicp_result.fitness_score,
+                        self.keyframe_poses[candidate_id],
+                        self.keyframe_poses[i])
+                    return result
 
         # odom_only 模式：只使用 Odom 直接验证，跳过 BTC/SC 搜索
         if self.use_method == 'odom_only':
@@ -1590,23 +1594,14 @@ class OfflineLoopCloser:
 
             if (gicp_result and gicp_result.has_converged and
                     gicp_result.fitness_score < self.gicp_config.fitness_score_threshold):
-                is_degenerate, deg_dir, eigvals = check_degeneracy(
-                    self.keyframe_clouds_ds[curr_idx],
-                    self.keyframe_clouds_ds[prev_idx],
-                    gicp_result.transformation,
-                    max_correspondence_distance=self.gicp_config.max_correspondence_distance
-                )
-                if not is_degenerate:
-                    relative_pose_matrix = gicp_result.transformation
-                    gicp_success = True
-                    gicp_fitness = gicp_result.fitness_score
-                    print(f"  [GICP] 精化成功! Fitness: {gicp_result.fitness_score:.4f}")
-                    self._save_fused_cloud(curr_idx, prev_idx, gicp_result.transformation,
-                                           initial_guess, gicp_result.fitness_score,
-                                           gicp_result.overlap_ratio, 'btc_loop')
-                else:
-                    print(f"  [GICP] 检测到退化方向，拒绝回环!")
-                    return result
+                # 跳过 Degeneracy 检查（加速优化）
+                relative_pose_matrix = gicp_result.transformation
+                gicp_success = True
+                gicp_fitness = gicp_result.fitness_score
+                print(f"  [GICP] 精化成功! Fitness: {gicp_result.fitness_score:.4f}")
+                self._save_fused_cloud(curr_idx, prev_idx, gicp_result.transformation,
+                                       initial_guess, gicp_result.fitness_score,
+                                       gicp_result.overlap_ratio, 'btc_loop')
             else:
                 fitness = gicp_result.fitness_score if gicp_result else float('inf')
                 print(f"  [GICP] 精化失败或分数过高 "

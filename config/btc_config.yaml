@@ -341,7 +341,7 @@ gicp:
   #   - 0.15: 适中（适合Mid360稀疏点云）
   #   - 0.30: 宽松
   #   - 策略：放宽到0.25，作为最终把关（效果不好再收紧）
-  fitness_score_threshold: 0.05
+  fitness_score_threshold: 0.08
 
   # max_correspondence_distance: 最大对应点距离 (m)
   #   - GICP匹配时，两点距离 < 此阈值才算对应点
