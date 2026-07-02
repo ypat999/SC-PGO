@@ -53,7 +53,7 @@ def parse_args():
     parser.add_argument("data_dir", nargs="?", default="/home/ywj/save_data/",
                         help="数据目录 (默认: /home/ywj/save_data/)")
 
-    parser.add_argument("--btc-config", type=str, default=None,
+    parser.add_argument("--btc-config", type=str, default="../../config/btc_config.yaml",
                         help="统一配置文件路径，包含BTC+GICP+关键帧+验证参数 (默认: 使用内置默认值)")
 
     # 关键帧参数 (对应 launch 文件中的 keyframe_meter_gap)
@@ -93,19 +93,19 @@ def parse_args():
                         help="跳过邻近帧数 - 帧号差值<=此值时不检测回环 (默认: 5)")
 
     # 多帧合并参数 (针对点云稀疏的雷达如 Mid360)
-    parser.add_argument("--merge-n", type=int, default=1,
+    parser.add_argument("--merge-n", type=int, default=10,
                         help="每N帧合并为一帧，提升点云密度 (默认: 1, 不合并)。Mid360推荐10")
 
     # ROS2 可视化输出（用于在 RViz 中比较 PGO 效果）
-    parser.add_argument("--ros2", action="store_true",
+    parser.add_argument("--ros2", action="store_true", default=True,
                         help="启用 ROS2 话题输出: odom_keyframe_path / optimized_path / loop_match_markers")
     parser.add_argument("--ros2-node-name", type=str, default="offline_loop_closure",
                         help="ROS2 节点名 (默认: offline_loop_closure)")
-    parser.add_argument("--ros2-keep-alive", action="store_true",
+    parser.add_argument("--ros2-keep-alive", action="store_true", default=True,
                         help="处理完成后保持节点运行（便于在 RViz 中查看话题），按 Ctrl+C 退出")
 
     # 多线程加速
-    parser.add_argument("--num-threads", type=int, default=0,
+    parser.add_argument("--num-threads", type=int, default=4,
                         help="多线程加速的线程数 (默认: 0=自动检测CPU核心数)")
 
     return parser.parse_args()
