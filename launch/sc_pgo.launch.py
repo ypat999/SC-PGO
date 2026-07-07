@@ -12,11 +12,24 @@ def generate_launch_description():
     rvizscpgo_arg = DeclareLaunchArgument(
         "rvizscpgo", default_value="true", description="Launch RViz for SC-PGO"
     )
-    # namespace_arg = DeclareLaunchArgument(
-    #     "namespace", default_value="", description="Namespace for all nodes"
-    # )
-
-    # namespace = LaunchConfiguration("namespace")
+    
+    save_directory_arg = DeclareLaunchArgument(
+        "save_directory", 
+        default_value="/home/ywj/save_data/", 
+        description="Directory to save map PCD, optimized poses and keyframe data"
+    )
+    
+    save_map_service_name_arg = DeclareLaunchArgument(
+        "save_map_service_name", 
+        default_value="save_map", 
+        description="Service name for saving map"
+    )
+    
+    map_filename_arg = DeclareLaunchArgument(
+        "map_filename", 
+        default_value="map.pcd", 
+        description="Filename of the saved map PCD file"
+    )
 
     alaserPGO_node = Node(
         package="sc_pgo_ros2",
@@ -32,7 +45,9 @@ def generate_launch_description():
             {"keyframe_meter_gap": 5.0},
             {"sc_dist_thres": 0.3},
             {"sc_max_radius": 290.0},
-            {"save_directory": "/home/ywj/save_data/"},
+            {"save_directory": LaunchConfiguration("save_directory")},
+            {"save_map_service_name": LaunchConfiguration("save_map_service_name")},
+            {"map_filename": LaunchConfiguration("map_filename")},
             # GICP parameters for loop closure refinement
             {"use_gicp_for_loop_closure": True},
             {"gicp_fitness_score_threshold": 0.5},
@@ -65,4 +80,4 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration("rvizscpgo")),
     )
 
-    return LaunchDescription([rvizscpgo_arg, alaserPGO_node])
+    return LaunchDescription([rvizscpgo_arg, save_directory_arg, save_map_service_name_arg, map_filename_arg, alaserPGO_node])

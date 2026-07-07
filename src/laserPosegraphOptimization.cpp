@@ -41,6 +41,7 @@
 #include <sensor_msgs/msg/nav_sat_fix.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
+#include <std_srvs/srv/trigger.hpp>
 
 // #include <eigen3/Eigen/Dense>
 
@@ -147,7 +148,11 @@ rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pubLoopMatchM
 
 rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomRepubVerifier;
 
+rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr save_map_service;
+
 std::string save_directory;
+std::string save_map_service_name;
+std::string map_filename;
 std::string pgKITTIformat, pgScansDirectory;
 std::string odomKITTIformat;
 std::fstream pgTimeSaveStream;
@@ -1262,12 +1267,58 @@ void process_viz_map() {
   }
 }
 
+void saveMapCallback(const std_srvs::srv::Trigger::Request::SharedPtr req,
+                     const std_srvs::srv::Trigger::Response::SharedPtr res) {
+  std::cout << "[SaveMap] Request received. Saving map..." << std::endl;
+
+  if (recentIdxUpdated < 1) {
+    res->success = false;
+    res->message = "No map data available (insufficient keyframes)";
+    std::cout << "[SaveMap] Failed: " << res->message << std::endl;
+    return;
+  }
+
+  mKF.lock();
+  pcl::PointCloud<PointType>::Ptr mergedCloud(new pcl::PointCloud<PointType>());
+  for (int node_idx = 0; node_idx < recentIdxUpdated; node_idx++) {
+    *mergedCloud += *local2global(keyframeLaserClouds[node_idx],
+                                   keyframePosesUpdated[node_idx]);
+  }
+  mKF.unlock();
+
+  pcl::PointCloud<PointType>::Ptr filteredCloud(new pcl::PointCloud<PointType>());
+  downSizeFilterMapPGO.setInputCloud(mergedCloud);
+  downSizeFilterMapPGO.filter(*filteredCloud);
+
+  std::string full_map_path = save_directory + map_filename;
+  if (pcl::io::savePCDFileBinary(full_map_path, *filteredCloud) == 0) {
+    res->success = true;
+    res->message = "Map saved successfully to: " + full_map_path + 
+                   " (points: " + std::to_string(filteredCloud->size()) + ")";
+    std::cout << "[SaveMap] " << res->message << std::endl;
+  } else {
+    res->success = false;
+    res->message = "Failed to save map to: " + full_map_path;
+    std::cout << "[SaveMap] Error: " << res->message << std::endl;
+  }
+
+  std::string optimized_poses_filename = save_directory + "optimized_poses_final.txt";
+  saveOptimizedVerticesKITTIformat(isamCurrentEstimate, optimized_poses_filename);
+  std::cout << "[SaveMap] Optimized poses saved to: " << optimized_poses_filename << std::endl;
+}
+
 int main(int argc, char **argv) {
   rclcpp::init(argc, argv);
   nh = rclcpp::Node::make_shared("laserPGO");
 
   nh->declare_parameter<std::string>("save_directory", "/");
   save_directory = nh->get_parameter("save_directory").as_string();
+
+  nh->declare_parameter<std::string>("save_map_service_name", "save_map");
+  save_map_service_name = nh->get_parameter("save_map_service_name").as_string();
+
+  nh->declare_parameter<std::string>("map_filename", "map.pcd");
+  map_filename = nh->get_parameter("map_filename").as_string();
 
   nh->declare_parameter<std::string>("frame_id_odom", "odom");
   frame_id_odom = nh->get_parameter("frame_id_odom").as_string();
@@ -1421,6 +1472,10 @@ int main(int argc, char **argv) {
 
   pubLoopMatchMarkers = nh->create_publisher<visualization_msgs::msg::MarkerArray>(
       "loop_match_markers", rclcpp::QoS(100).transient_local());  // latched so late subscribers see all loops
+
+  save_map_service = nh->create_service<std_srvs::srv::Trigger>(
+      save_map_service_name, std::bind(&saveMapCallback, std::placeholders::_1, std::placeholders::_2));
+  std::cout << "[SC-PGO] Save map service registered at: " << save_map_service->get_service_name() << std::endl;
 
   std::thread posegraph_slam{process_pg};  // pose graph construction
   std::thread lc_detection{process_lcd};   // loop closure detection
