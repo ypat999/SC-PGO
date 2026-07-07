@@ -31,43 +31,27 @@ def generate_launch_description():
         description="Filename of the saved map PCD file"
     )
 
+    pkg_share_dir = get_package_share_directory("sc_pgo_ros2")
+    config_file = PathJoinSubstitution([pkg_share_dir, "config", "btc_config.yaml"])
+
     alaserPGO_node = Node(
         package="sc_pgo_ros2",
         executable="alaserPGO",
         name="alaserPGO",
         output="screen",
         parameters=[
-            {"scan_line": 4},
-            {"minimum_range": 0.3},
-            {"mapping_line_resolution": 0.4},
-            {"mapping_plane_resolution": 0.8},
-            {"mapviz_filter_size": 0.05},
-            {"keyframe_meter_gap": 5.0},
-            {"sc_dist_thres": 0.3},
-            {"sc_max_radius": 290.0},
+            config_file,
             {"save_directory": LaunchConfiguration("save_directory")},
             {"save_map_service_name": LaunchConfiguration("save_map_service_name")},
             {"map_filename": LaunchConfiguration("map_filename")},
-            # GICP parameters for loop closure refinement
-            {"use_gicp_for_loop_closure": True},
-            {"gicp_fitness_score_threshold": 0.5},
-            {"gicp_transformation_epsilon": 1e-6},
-            {"gicp_max_correspondence_distance": 30.0},
-            {"gicp_max_iterations": 100},
-            {"gicp_num_threads": 4},
         ],
         remappings=[
-            # ("/aft_mapped_to_init", "/Odometry"),
-            # ("/aft_mapped_to_init", "/lio/odom"),
-            # ("/velodyne_cloud_registered_local", "/lio/body/cloud"),
-            # ("/cloud_for_scancontext", "/lio/cloud_world"),
             ("/tf", "tf"),
             ("/tf_static", "tf_static"),
         ],
-        prefix=['taskset -c 6'],   # 绑定 CPU 4
+        prefix=['taskset -c 6'],
     )
 
-    # RViz Node
     rviz_node = Node(
         package="rviz2",
         executable="rviz2",

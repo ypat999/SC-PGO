@@ -388,4 +388,55 @@ gicp:
   coarse_max_iter: 50
 
 
+# ================================================================================
+# ROS2 节点参数（laserPGO node）
+# ================================================================================
+# 通过 ros2 launch 加载到 laserPGO 节点的 ros__parameters
+# ================================================================================
+
+laserPGO:
+  ros__parameters:
+    # 基础配置
+    scan_line: 4
+    minimum_range: 0.3
+    mapping_line_resolution: 0.4
+    mapping_plane_resolution: 0.8
+    mapviz_filter_size: 0.05
+
+    # 关键帧配置
+    keyframe_meter_gap: 5.0
+    keyframe_deg_gap: 10.0
+
+    # ScanContext 参数
+    sc_dist_thres: 0.3
+    sc_max_radius: 290.0
+
+    # 保存配置
+    save_directory: "/home/ywj/save_data/"
+    save_map_service_name: "save_map"
+    map_filename: "map.pcd"
+
+    # 坐标系配置
+    frame_id_odom: "odom"
+    frame_id_aft_pgo: "aft_pgo"
+
+    # GICP 精化配置
+    use_gicp_for_loop_closure: true
+    gicp_fitness_score_threshold: 0.5
+    gicp_transformation_epsilon: 0.000001
+    gicp_max_correspondence_distance: 30.0
+    gicp_max_iterations: 100
+    gicp_num_threads: 4
+    gicp_max_init_translation: 15.0
+    gicp_scan_ds_size: 0.1
+    gicp_coarse_ds_size: 0.25
+    gicp_coarse_max_iter: 50
+    gicp_coarse_max_dist: 10.0
+
+    # 回环验证配置
+    max_loop_distance: 100.0
+    max_yaw_diff: 2.35619
+    odom_direct_threshold: 3.0
+
+
 

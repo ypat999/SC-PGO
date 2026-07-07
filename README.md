@@ -181,6 +181,9 @@ python3 offline_loop_closure.py \
 | `loop_validation` | 回环验证参数（最大距离、偏航角差等） |
 | `gicp` | GICP 精化参数 |
 | `keyframe` | 关键帧选择参数 |
+| `laserPGO.ros__parameters` | ROS2 节点参数（关键帧、GICP、保存配置等） |
+
+**注意**：所有 launch 参数（如 `save_directory`、`save_map_service_name`、`map_filename`）均可在 `laserPGO.ros__parameters` 块中配置默认值，并可通过 launch 命令行参数覆盖。
 
 ## 项目结构
 
