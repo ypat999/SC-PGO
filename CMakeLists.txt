@@ -27,6 +27,7 @@ find_package(OpenMP REQUIRED)
 find_package(GTSAM REQUIRED QUIET)
 find_package(pcl_conversions REQUIRED)
 find_package(pcl_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
 
 # ndt_omp_ros2 dependency for GICP_OMP
 find_package(ndt_omp_ros2 REQUIRED)
@@ -54,7 +55,7 @@ add_executable(alaserPGO
 )
 ament_target_dependencies(alaserPGO
   rclcpp sensor_msgs geometry_msgs nav_msgs std_msgs visualization_msgs tf2 tf2_ros
-  cv_bridge pcl_conversions pcl_msgs ament_index_cpp ndt_omp_ros2
+  cv_bridge pcl_conversions pcl_msgs ament_index_cpp ndt_omp_ros2 std_srvs
 )
 target_compile_options(alaserPGO PRIVATE ${OpenMP_CXX_FLAGS})
 target_link_libraries(alaserPGO
