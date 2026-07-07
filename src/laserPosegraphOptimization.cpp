@@ -172,6 +172,9 @@ double gicp_max_init_translation = 15.0;
 double max_loop_distance = 100.0;
 double max_yaw_diff = M_PI * 0.75;
 
+// Loop closure method
+std::string loop_closure_method;
+
 // Odom Direct verification
 double odom_direct_threshold = 3.0;  // odom距离<此值时跳过BTC直接GICP验证
 
@@ -1006,6 +1009,7 @@ void performSCLoopClosure(void) {
   int curr_frame_id = keyframePoses.size() - 1;
 
   // ===== Odom Direct 验证: odom距离<阈值时直接GICP，跳过BTC =====
+  // odom_only 和 btc 模式都支持 Odom Direct 验证
   if (use_gicp_for_loop_closure && odom_direct_threshold > 0) {
     mKF.lock();
     Pose6D curr_pose = keyframePoses[curr_frame_id];
@@ -1071,6 +1075,12 @@ void performSCLoopClosure(void) {
         }
       }
     }
+  }
+
+  // ===== 根据 use_method 决定是否执行 BTC 回环检测 =====
+  if (loop_closure_method == "odom_only") {
+    cout << "[SC-PGO] use_method=odom_only, skipping BTC loop closure" << endl;
+    return;
   }
 
   // ===== BTC 回环检测（正常流程） =====
@@ -1407,10 +1417,13 @@ int main(int argc, char **argv) {
   nh->declare_parameter<double>("sc_dist_thres", 0.2);
   scDistThres = nh->get_parameter("sc_dist_thres").as_double();
 
-  nh->declare_parameter<double>(
-      "sc_max_radius",
+  nh->declare_parameter<double>("sc_max_radius",
       20.0);
   scMaximumRadius = nh->get_parameter("sc_max_radius").as_double();
+
+  nh->declare_parameter<std::string>("use_method", "btc");
+  loop_closure_method = nh->get_parameter("use_method").as_string();
+  std::cout << "[SC-PGO] Loop closure method: " << loop_closure_method << std::endl;
 
   ISAM2Params parameters;
   parameters.relinearizeThreshold = 0.01;

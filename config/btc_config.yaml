@@ -411,10 +411,15 @@ laserPGO:
     sc_dist_thres: 0.3
     sc_max_radius: 290.0
 
+    # 回环检测方法
+    # btc: 使用BTC回环检测 + Odom Direct验证
+    # odom_only: 只使用Odom Direct验证，不执行BTC回环检测
+    use_method: "odom_only"
+
     # 保存配置
-    save_directory: "/home/ywj/save_data/"
+    save_directory: "/home/ywj/slam_data/"
     save_map_service_name: "save_map"
-    map_filename: "map.pcd"
+    map_filename: "test.pcd"
 
     # 坐标系配置
     frame_id_odom: "odom"
