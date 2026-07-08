@@ -1,4 +1,5 @@
 #include <math.h>
+#include <algorithm>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 
@@ -11,6 +12,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sstream>
 #include <string>
+#include <sys/stat.h>
 #include <thread>
 #include <vector>
 // #include <pcl/search/impl/search.hpp>
@@ -74,8 +76,8 @@ using std::endl;
 
 double keyframeMeterGap;
 double keyframeDegGap, keyframeRadGap;
-double translationAccumulated = 1000000.0;
-double rotaionAccumulated = 1000000.0;
+double translationAccumulated = 0.0;
+double rotaionAccumulated = 0.0;
 
 bool isNowKeyFrame = false;
 
@@ -177,6 +179,7 @@ std::string loop_closure_method;
 
 // Odom Direct verification
 double odom_direct_threshold = 3.0;  // odom距离<此值时跳过BTC直接GICP验证
+int max_gicp_candidates = 5;  // 每次回环检测最多GICP匹配的候选帧数
 
 std::string padZeros(int val, int num_digits = 6) {
   std::ostringstream out;
@@ -762,7 +765,7 @@ void process_pg() {
                  rclcpp::Time(fullResBuf.front()->header.stamp).seconds())
         odometryBuf.pop();
       if (odometryBuf.empty()) {
-        cout << "Odometry buffer empty after sync, breaking..." << endl;
+        // Odometry buffer empty - skip silently
         mBuf.unlock();
         break;
       }
@@ -872,20 +875,24 @@ void process_pg() {
            << ", pitch: " << pose_curr.pitch << ", yaw: " << pose_curr.yaw << endl;
 
       int curr_frame_id = keyframePoses.size() - 1;
-      std::vector<BTC> btcs_vec;
-      pcl::PointCloud<pcl::PointXYZI>::Ptr btcCloud(new pcl::PointCloud<pcl::PointXYZI>);
-      pcl::copyPointCloud(*thisKeyFrameDS, *btcCloud);
-      cout << "[BTC] Starting GenerateBtcDescs for frame " << curr_frame_id
-           << ", cloud points: " << btcCloud->size() << endl;
-      try {
-        btcManager.GenerateBtcDescs(btcCloud, curr_frame_id, btcs_vec);
-        cout << "[BTC] GenerateBtcDescs done, btcs count: " << btcs_vec.size() << endl;
-      } catch (const std::exception &e) {
-        std::cerr << "[BTC] GenerateBtcDescs exception: " << e.what() << std::endl;
-        throw;
+      
+      // 仅在使用BTC方法时生成和添加BTC描述子
+      if (loop_closure_method == "btc") {
+        std::vector<BTC> btcs_vec;
+        pcl::PointCloud<pcl::PointXYZI>::Ptr btcCloud(new pcl::PointCloud<pcl::PointXYZI>);
+        pcl::copyPointCloud(*thisKeyFrameDS, *btcCloud);
+        cout << "[BTC] Starting GenerateBtcDescs for frame " << curr_frame_id
+             << ", cloud points: " << btcCloud->size() << endl;
+        try {
+          btcManager.GenerateBtcDescs(btcCloud, curr_frame_id, btcs_vec);
+          cout << "[BTC] GenerateBtcDescs done, btcs count: " << btcs_vec.size() << endl;
+        } catch (const std::exception &e) {
+          std::cerr << "[BTC] GenerateBtcDescs exception: " << e.what() << std::endl;
+          throw;
+        }
+        btcManager.AddBtcDescs(btcs_vec);
+        cout << "[BTC] AddBtcDescs done" << endl;
       }
-      btcManager.AddBtcDescs(btcs_vec);
-      cout << "[BTC] AddBtcDescs done" << endl;
 
       laserCloudMapPGORedraw = true;
       mKF.unlock();
@@ -991,12 +998,6 @@ void process_pg() {
     // wait (must required for running the while loop)
     std::chrono::milliseconds dura(2);
     std::this_thread::sleep_for(dura);
-    
-    if (frame_counter > 0 && frame_counter % 1000 == 0) {
-      cout << "Process PG still running... Total frames processed: " << frame_counter << endl;
-      cout << "Odometry buffer size: " << odometryBuf.size() << endl;
-      cout << "FullRes buffer size: " << fullResBuf.size() << endl;
-    }
   }
 }  // process_pg
 
@@ -1017,12 +1018,19 @@ void performSCLoopClosure(void) {
     mKF.unlock();
 
     int skip_near = btcManager.config_setting_.skip_near_num_;
-    for (int j = 0; j < curr_frame_id; j++) {
-      if ((curr_frame_id - j) <= skip_near) continue;  // 跳过邻近帧
-
+    
+    // 第一阶段：收集所有候选帧（仅距离+角度初筛，不做GICP）
+    struct LoopCandidate {
+      int frame_id;
+      double odom_dist;
+      double yaw_diff;
+      Eigen::Matrix4d init_guess;
+    };
+    std::vector<LoopCandidate> candidates;
+    
+    for (int j = curr_frame_id - skip_near - 1; j >= 0; j--) {
       mKF.lock();
       Pose6D prev_pose = keyframePoses[j];
-      auto prev_cloud = keyframeLaserClouds[j];
       mKF.unlock();
 
       double dx = curr_pose.x - prev_pose.x;
@@ -1030,49 +1038,66 @@ void performSCLoopClosure(void) {
       double dz = curr_pose.z - prev_pose.z;
       double odom_dist = sqrt(dx*dx + dy*dy + dz*dz);
 
-      if (odom_dist < odom_direct_threshold) {
-        // 计算 odom 相对位姿初值
-        gtsam::Pose3 pose_prev_gtsam = Pose6DtoGTSAMPose3(prev_pose);
-        gtsam::Pose3 pose_curr_gtsam = Pose6DtoGTSAMPose3(curr_pose);
-        gtsam::Pose3 odom_relative = pose_prev_gtsam.between(pose_curr_gtsam);
-        Eigen::Matrix4d init_guess = odom_relative.matrix();
+      if (odom_dist > odom_direct_threshold) continue;
 
-        double init_t = init_guess.block<3, 1>(0, 3).norm();
-        if (init_t > gicp_max_init_translation) {
-          cout << "[Odom Direct] frame " << j << " odom_dist=" << odom_dist
-               << "m, but init_t=" << init_t << "m > " << gicp_max_init_translation
-               << "m, skip" << endl;
-          continue;
+      double yaw_diff = fabs(curr_pose.yaw - prev_pose.yaw);
+      if (yaw_diff > max_yaw_diff) continue;
+
+      gtsam::Pose3 pose_prev_gtsam = Pose6DtoGTSAMPose3(prev_pose);
+      gtsam::Pose3 pose_curr_gtsam = Pose6DtoGTSAMPose3(curr_pose);
+      gtsam::Pose3 odom_relative = pose_prev_gtsam.between(pose_curr_gtsam);
+      Eigen::Matrix4d init_guess = odom_relative.matrix();
+
+      double init_t = init_guess.block<3, 1>(0, 3).norm();
+      if (init_t > gicp_max_init_translation) continue;
+
+      candidates.push_back({j, odom_dist, yaw_diff, init_guess});
+    }
+
+    // 第二阶段：按距离排序，只取前 max_gicp_candidates 帧
+    std::sort(candidates.begin(), candidates.end(),
+      [](const LoopCandidate& a, const LoopCandidate& b) {
+        return a.odom_dist < b.odom_dist;  // 距离越小越优先
+      });
+
+    int gicp_count = 0;
+    cout << "[Odom Direct] Found " << candidates.size() 
+         << " candidates, trying top " << max_gicp_candidates << endl;
+
+    for (const auto& cand : candidates) {
+      if (gicp_count >= max_gicp_candidates) break;
+
+      mKF.lock();
+      auto prev_cloud = keyframeLaserClouds[cand.frame_id];
+      mKF.unlock();
+
+      cout << "[Odom Direct] frame " << curr_frame_id << " <-> " << cand.frame_id
+           << " odom_dist=" << cand.odom_dist << "m, yaw_diff=" << cand.yaw_diff 
+           << "rad, trying GICP..." << endl;
+      gicp_count++;
+
+      sc_pgo::GICPResult gicp_result = gicp_registration->align(
+        curr_cloud, prev_cloud, cand.init_guess
+      );
+
+      if (gicp_result.has_converged &&
+          gicp_result.fitness_score < gicp_fitness_score_threshold) {
+        gtsam::Pose3 relative_pose(gicp_result.transformation.cast<double>());
+
+        if (validateLoopClosure(cand.frame_id, curr_frame_id, relative_pose)) {
+          mtxPosegraph.lock();
+          gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(
+              cand.frame_id, curr_frame_id, relative_pose, robustLoopNoise));
+          mtxPosegraph.unlock();
+          cout << "[Odom Direct] constraint added between " << cand.frame_id
+               << " and " << curr_frame_id << " (fitness="
+               << gicp_result.fitness_score << ")" << endl;
+          publishLoopMatchMarkers(cand.frame_id, curr_frame_id, gicp_result.fitness_score);
+          return;  // 找到一个就返回，跳过BTC流程
         }
-
-        cout << "[Odom Direct] frame " << curr_frame_id << " <-> " << j
-             << " odom_dist=" << odom_dist << "m < " << odom_direct_threshold
-             << "m, trying GICP..." << endl;
-
-        sc_pgo::GICPResult gicp_result = gicp_registration->align(
-          curr_cloud, prev_cloud, init_guess
-        );
-
-        if (gicp_result.has_converged &&
-            gicp_result.fitness_score < gicp_fitness_score_threshold) {
-          gtsam::Pose3 relative_pose(gicp_result.transformation.cast<double>());
-
-          if (validateLoopClosure(j, curr_frame_id, relative_pose)) {
-            mtxPosegraph.lock();
-            gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(
-                j, curr_frame_id, relative_pose, robustLoopNoise));
-            mtxPosegraph.unlock();
-            cout << "[Odom Direct] constraint added between " << j
-                 << " and " << curr_frame_id << " (fitness="
-                 << gicp_result.fitness_score << ")" << endl;
-            // publish loop match markers (two points + connecting line)
-            publishLoopMatchMarkers(j, curr_frame_id, gicp_result.fitness_score);
-            return;  // 找到一个就返回，跳过BTC流程
-          }
-        } else {
-          cout << "[Odom Direct] GICP failed (fitness="
-               << gicp_result.fitness_score << "), continue searching" << endl;
-        }
+      } else {
+        cout << "[Odom Direct] GICP failed (fitness="
+             << gicp_result.fitness_score << ")" << endl;
       }
     }
   }
@@ -1229,7 +1254,6 @@ void process_isam() {
     if (gtSAMgraphMade) {
       mtxPosegraph.lock();
       runISAM2opt();
-      std::cout << "running isam2 optimization ..." << std::endl;
       mtxPosegraph.unlock();
 
       saveOptimizedVerticesKITTIformat(isamCurrentEstimate, pgKITTIformat);
@@ -1398,6 +1422,10 @@ int main(int argc, char **argv) {
   nh->declare_parameter<double>("odom_direct_threshold", 3.0);
   odom_direct_threshold = nh->get_parameter("odom_direct_threshold").as_double();
 
+  // Max GICP candidates per loop closure attempt
+  nh->declare_parameter<int>("max_gicp_candidates", 5);
+  max_gicp_candidates = nh->get_parameter("max_gicp_candidates").as_int();
+
   nh->declare_parameter<double>("keyframe_meter_gap", 2.0);
   keyframeMeterGap = nh->get_parameter("keyframe_meter_gap").as_double();
 
@@ -1411,6 +1439,10 @@ int main(int argc, char **argv) {
   pgTimeSaveStream.precision(std::numeric_limits<double>::max_digits10);
   pgScansDirectory = save_directory + "Scans/";
   cout << "pgScansDirectory " << pgScansDirectory << endl;
+
+  // 确保保存目录存在
+  mkdir(save_directory.c_str(), 0755);
+  mkdir(pgScansDirectory.c_str(), 0755);
 
   keyframeRadGap = deg2rad(keyframeDegGap);
 
@@ -1431,14 +1463,42 @@ int main(int argc, char **argv) {
   isam = new ISAM2(parameters);
   initNoises();
 
-  nh->declare_parameter<std::string>("btc_config_file", "");
-  std::string btc_config_file = nh->get_parameter("btc_config_file").as_string();
-  if (btc_config_file.empty()) {
-    std::string pkg_share_dir = ament_index_cpp::get_package_share_directory("sc_pgo_ros2");
-    btc_config_file = pkg_share_dir + "/config/btc_config.yaml";
-  }
+  // 从ROS2参数系统读取BTC配置（替代OpenCV FileStorage）
   ConfigSetting btc_config;
-  load_config_setting(btc_config_file, btc_config);
+  btc_config.voxel_size_ = nh->declare_parameter("voxel_size", 0.25);
+  btc_config.voxel_init_num_ = nh->declare_parameter("voxel_init_num", 1);
+  btc_config.plane_detection_thre_ = nh->declare_parameter("plane_detection_thre", 0.03);
+  btc_config.proj_plane_num_ = nh->declare_parameter("proj_plane_num", 3);
+  btc_config.proj_image_resolution_ = nh->declare_parameter("proj_image_resolution", 0.8);
+  btc_config.proj_image_high_inc_ = nh->declare_parameter("proj_image_high_inc", 0.8);
+  btc_config.proj_dis_min_ = nh->declare_parameter("proj_dis_min", 0.0);
+  btc_config.proj_dis_max_ = nh->declare_parameter("proj_dis_max", 10.0);
+  btc_config.summary_min_thre_ = nh->declare_parameter("summary_min_thre", 3.0);
+  btc_config.line_filter_enable_ = nh->declare_parameter("line_filter_enable", 0);
+  btc_config.descriptor_near_num_ = nh->declare_parameter("descriptor_near_num", 10.0);
+  btc_config.descriptor_min_len_ = nh->declare_parameter("descriptor_min_len", 0.3);
+  btc_config.descriptor_max_len_ = nh->declare_parameter("descriptor_max_len", 20.0);
+  btc_config.useful_corner_num_ = nh->declare_parameter("useful_corner_num", 30);
+  btc_config.non_max_suppression_radius_ = nh->declare_parameter("non_max_suppression_radius", 1.5);
+  btc_config.plane_merge_normal_thre_ = nh->declare_parameter("plane_merge_normal_thre", 0.25);
+  btc_config.plane_merge_dis_thre_ = nh->declare_parameter("plane_merge_dis_thre", 0.8);
+  btc_config.skip_near_num_ = nh->declare_parameter("skip_near_num", 20);
+  btc_config.candidate_num_ = nh->declare_parameter("candidate_num", 3);
+  btc_config.rough_dis_threshold_ = nh->declare_parameter("rough_dis_threshold", 0.10);
+  btc_config.similarity_threshold_ = nh->declare_parameter("similarity_threshold", 0.3);
+  btc_config.icp_threshold_ = nh->declare_parameter("icp_threshold", 0.01);
+  btc_config.normal_threshold_ = nh->declare_parameter("normal_threshold", 0.3);
+  btc_config.dis_threshold_ = nh->declare_parameter("dis_threshold", 1.0);
+  btc_config.std_side_resolution_ = nh->declare_parameter("triangle_resolution", 0.4);
+  btc_config.geom_side_std_threshold_ = nh->declare_parameter("geom_side_std_threshold", 12.0);
+  btc_config.geom_center_std_threshold_ = nh->declare_parameter("geom_center_std_threshold", 30.0);
+  btc_config.ransac_min_vote_ = nh->declare_parameter("ransac_min_vote", 3);
+  btc_config.ransac_max_iterations_ = nh->declare_parameter("ransac_max_iterations", 10);
+  btc_config.ransac_sample_max_ = nh->declare_parameter("ransac_sample_max", 50);
+  btc_config.ransac_correspondence_dis_ = nh->declare_parameter("ransac_correspondence_dis", 3.0);
+  btc_config.candidate_selector_min_vote_ = nh->declare_parameter("candidate_selector_min_vote", 5);
+  btc_config.candidate_verify_min_pairs_ = nh->declare_parameter("candidate_verify_min_pairs", 5);
+  btc_config.icp_point_to_point_max_ = nh->declare_parameter("icp_point_to_point_max", 3.0);
   btcManager = BtcDescManager(btc_config);
 
   float filter_size = 0.4;
