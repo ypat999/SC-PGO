@@ -33,7 +33,7 @@
     #   - 两帧位置差 > meter_gap 才选为关键帧
     #   - 小值 (1.0): 关键帧多 → 回环召回高但慢
     #   - 大值 (5.0): 关键帧少 → 快但可能漏回环
-    keyframe_meter_gap: 0.5
+    keyframe_meter_gap: 1.0
 
     # keyframe_deg_gap: 关键帧角度间隔 (deg)
     #   - 两帧角度差 > deg_gap 才选为关键帧
@@ -333,14 +333,14 @@
     #   - 大值 (5.0): 对较近距离帧直接验证（提高召回率）
     #   - ⚠️ 配合 skip_near_num 使用，避免邻近帧误检
     #   - ⚠️ 建议降低到1.5以减少无效GICP尝试，加快遍历速度
-    odom_direct_threshold: 3.0
+    odom_direct_threshold: 2.0
 
     # max_gicp_candidates: 每次回环检测最多GICP匹配的候选帧数
     #   - 收集所有候选后按距离排序，只取前N帧进行GICP验证
     #   - 适用于Odom Direct和BTC两种回环方式
     #   - 小值 (3): 快速验证，适合在线实时场景
     #   - 大值 (10): 充分验证，适合离线建图场景
-    max_gicp_candidates: 5
+    max_gicp_candidates: 1
 
     # ================================================================================
     # GICP 配置（Point-to-Plane ICP 精化）
@@ -359,7 +359,7 @@
     #   - 0.15: 适中（适合Mid360稀疏点云）
     #   - 0.30: 宽松
     #   - 策略：放宽到0.08，作为最终把关（效果不好再收紧）
-    gicp_fitness_score_threshold: 0.08
+    gicp_fitness_score_threshold: 0.15
 
     # gicp_max_correspondence_distance: 最大对应点距离 (m)
     #   - GICP匹配时，两点距离 < 此阈值才算对应点
@@ -369,14 +369,14 @@
 
     # gicp_max_iterations: 精配准最大迭代次数
     #   - 迭代次数上限，防止不收敛时无限循环
-    gicp_max_iterations: 32
+    gicp_max_iterations: 64
 
     # gicp_transformation_epsilon: 收敛精度（变换增量阈值）
     #   - 变换增量 < 此阈值时停止迭代（收敛）
     gicp_transformation_epsilon: 0.001
 
     # gicp_num_threads: GICP并行线程数
-    gicp_num_threads: 4
+    gicp_num_threads: 2
 
     # gicp_max_init_translation: GICP初始平移阈值 (m)
     #   - GICP初始位姿的平移分量超过此值时，跳过验证（避免GICP崩溃）
@@ -398,7 +398,7 @@
 
     # gicp_coarse_max_iter: 粗配准最大迭代次数
     #   - 粗配准阶段用更粗下采样，加快收敛
-    gicp_coarse_max_iter: 16
+    gicp_coarse_max_iter: 8
 
     # gicp_coarse_max_dist: 粗配准最大对应距离 (m)
     #   - 粗配准阶段用更大对应距离，帮助收敛
@@ -409,7 +409,7 @@
     # 保存配置
     # ================================================================================
     save_directory: "/home/ztl/slam_data/pcd/"
-    save_map_service_name: "save_map"
+    save_map_service_name: "map_save"
     map_filename: "test.pcd"
 
     # ================================================================================
