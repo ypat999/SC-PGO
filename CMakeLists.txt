@@ -52,6 +52,7 @@ add_executable(alaserPGO
   src/laserPosegraphOptimization.cpp
   src/btc.cpp
   src/gicp_registration.cpp
+  src/dynamic_remove.cpp
 )
 ament_target_dependencies(alaserPGO
   rclcpp sensor_msgs geometry_msgs nav_msgs std_msgs visualization_msgs tf2 tf2_ros

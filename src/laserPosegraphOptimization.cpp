@@ -67,6 +67,7 @@
 #include "aloam_velodyne/tic_toc.h"
 #include "btc/btc.h"
 #include "gicp_registration/gicp_registration.hpp"
+#include "dynamic_remove.hpp"
 #include <ament_index_cpp/get_package_share_directory.hpp>
 
 using namespace gtsam;
@@ -180,6 +181,9 @@ std::string loop_closure_method;
 // Odom Direct verification
 double odom_direct_threshold = 3.0;  // odom距离<此值时跳过BTC直接GICP验证
 int max_gicp_candidates = 5;  // 每次回环检测最多GICP匹配的候选帧数
+
+// Dynamic point removal configuration
+DynamicRemove::Config dynamic_remove_config;
 
 std::string padZeros(int val, int num_digits = 6) {
   std::ostringstream out;
@@ -1312,28 +1316,127 @@ void saveMapCallback(const std_srvs::srv::Trigger::Request::SharedPtr req,
     return;
   }
 
-  mKF.lock();
-  pcl::PointCloud<PointType>::Ptr mergedCloud(new pcl::PointCloud<PointType>());
-  for (int node_idx = 0; node_idx < recentIdxUpdated; node_idx++) {
-    *mergedCloud += *local2global(keyframeLaserClouds[node_idx],
-                                   keyframePosesUpdated[node_idx]);
-  }
-  mKF.unlock();
+  namespace dr = DynamicRemove;
 
-  pcl::PointCloud<PointType>::Ptr filteredCloud(new pcl::PointCloud<PointType>());
-  downSizeFilterMapPGO.setInputCloud(mergedCloud);
-  downSizeFilterMapPGO.filter(*filteredCloud);
+  if (dynamic_remove_config.enable) {
+    // ================================================================
+    // Dynamic removal ENABLED flow:
+    //   1. Collect in-memory keyframe clouds (local frame, not merged)
+    //   2. Apply temporal filter -> per-frame filtered clouds
+    //   3. Apply isolated removal (if enabled) to each filtered frame
+    //   4. Save per-frame filtered clouds as intermediate PCD files
+    //   5. Merge intermediate PCDs -> downsample -> save final map
+    //   6. Also save original unfiltered map as backup
+    // ================================================================
 
-  std::string full_map_path = save_directory + map_filename;
-  if (pcl::io::savePCDFileBinary(full_map_path, *filteredCloud) == 0) {
-    res->success = true;
-    res->message = "Map saved successfully to: " + full_map_path + 
-                   " (points: " + std::to_string(filteredCloud->size()) + ")";
-    std::cout << "[SaveMap] " << res->message << std::endl;
+    std::cout << "[SaveMap] Dynamic removal enabled (method=Temporal, window="
+              << dynamic_remove_config.frame_window << ")" << std::endl;
+
+    mKF.lock();
+    int n_kf = recentIdxUpdated;
+    std::vector<dr::CloudPtr> local_frames(n_kf);
+    std::vector<std::string> filenames(n_kf);
+    for (int i = 0; i < n_kf; ++i) {
+      local_frames[i] = keyframeLaserClouds[i];
+      filenames[i] = padZeros(i) + ".pcd";
+    }
+    mKF.unlock();
+
+    // Step 1: Temporal filter
+    std::vector<dr::CloudPtr> filtered_frames;
+    std::pair<int, int> stats;
+    dr::filterDynamicPointsTemporal(local_frames, dynamic_remove_config,
+                                    filtered_frames, &stats);
+    std::cout << "[SaveMap] Temporal filter: " << stats.second << " / "
+              << stats.first << " points removed ("
+              << (100.0 * stats.second / stats.first) << "%)" << std::endl;
+
+    // Step 2: Isolated removal (if enabled)
+    if (dynamic_remove_config.isolated_removal) {
+      std::cout << "[SaveMap] Applying isolated point removal..." << std::endl;
+      for (size_t i = 0; i < filtered_frames.size(); ++i) {
+        filtered_frames[i] = dr::removeIsolatedPoints(filtered_frames[i],
+                                                       dynamic_remove_config);
+      }
+    }
+
+    // Step 3: Save intermediate filtered PCDs
+    std::string intermediate_dir = save_directory + "filtered_intermediate/";
+    dr::saveFilteredFrames(filtered_frames, intermediate_dir, filenames);
+
+    // Step 4: Merge intermediate filtered PCDs
+    dr::CloudPtr merged_filtered = dr::mergeFilteredPCDs(intermediate_dir);
+
+    // Downsample merged cloud
+    pcl::PointCloud<PointType>::Ptr final_cloud(new pcl::PointCloud<PointType>());
+    downSizeFilterMapPGO.setInputCloud(merged_filtered);
+    downSizeFilterMapPGO.filter(*final_cloud);
+
+    // Save final map
+    std::string full_map_path = save_directory + map_filename;
+    if (pcl::io::savePCDFileBinary(full_map_path, *final_cloud) == 0) {
+      res->success = true;
+      res->message = "Map saved successfully to: " + full_map_path +
+                     " (points: " + std::to_string(final_cloud->size()) + ")";
+      std::cout << "[SaveMap] " << res->message << std::endl;
+    } else {
+      res->success = false;
+      res->message = "Failed to save map to: " + full_map_path;
+      std::cout << "[SaveMap] Error: " << res->message << std::endl;
+    }
+
+    // Step 5: Save original unfiltered map as backup
+    mKF.lock();
+    pcl::PointCloud<PointType>::Ptr ori_merged(new pcl::PointCloud<PointType>());
+    for (int i = 0; i < n_kf; ++i) {
+      *ori_merged += *local2global(keyframeLaserClouds[i],
+                                    keyframePosesUpdated[i]);
+    }
+    mKF.unlock();
+
+    pcl::PointCloud<PointType>::Ptr ori_final(new pcl::PointCloud<PointType>());
+    downSizeFilterMapPGO.setInputCloud(ori_merged);
+    downSizeFilterMapPGO.filter(*ori_final);
+
+    size_t dot_pos = map_filename.find_last_of('.');
+    std::string ori_name = (dot_pos != std::string::npos)
+        ? map_filename.substr(0, dot_pos) + "_ori" + map_filename.substr(dot_pos)
+        : map_filename + "_ori";
+    std::string ori_path = save_directory + ori_name;
+    if (pcl::io::savePCDFileBinary(ori_path, *ori_final) == 0) {
+      std::cout << "[SaveMap] Original (unfiltered) map saved as: " << ori_path
+                << " (points: " << ori_final->size() << ")" << std::endl;
+    } else {
+      std::cout << "[SaveMap] Warning: Failed to save original backup map" << std::endl;
+    }
+
   } else {
-    res->success = false;
-    res->message = "Failed to save map to: " + full_map_path;
-    std::cout << "[SaveMap] Error: " << res->message << std::endl;
+    // ================================================================
+    // Dynamic removal DISABLED: original flow
+    // ================================================================
+    mKF.lock();
+    pcl::PointCloud<PointType>::Ptr mergedCloud(new pcl::PointCloud<PointType>());
+    for (int node_idx = 0; node_idx < recentIdxUpdated; node_idx++) {
+      *mergedCloud += *local2global(keyframeLaserClouds[node_idx],
+                                     keyframePosesUpdated[node_idx]);
+    }
+    mKF.unlock();
+
+    pcl::PointCloud<PointType>::Ptr filteredCloud(new pcl::PointCloud<PointType>());
+    downSizeFilterMapPGO.setInputCloud(mergedCloud);
+    downSizeFilterMapPGO.filter(*filteredCloud);
+
+    std::string full_map_path = save_directory + map_filename;
+    if (pcl::io::savePCDFileBinary(full_map_path, *filteredCloud) == 0) {
+      res->success = true;
+      res->message = "Map saved successfully to: " + full_map_path +
+                     " (points: " + std::to_string(filteredCloud->size()) + ")";
+      std::cout << "[SaveMap] " << res->message << std::endl;
+    } else {
+      res->success = false;
+      res->message = "Failed to save map to: " + full_map_path;
+      std::cout << "[SaveMap] Error: " << res->message << std::endl;
+    }
   }
 
   std::string optimized_poses_filename = save_directory + "optimized_poses_final.txt";
@@ -1410,6 +1513,34 @@ int main(int argc, char **argv) {
   gicp_config.coarse_max_dist = nh->get_parameter("gicp_coarse_max_dist").as_double();
 
   gicp_registration = new sc_pgo::GICPRegistration(gicp_config);
+
+  // Dynamic point removal parameters
+  nh->declare_parameter<bool>("dynamic_removal.enable", true);
+  dynamic_remove_config.enable = nh->get_parameter("dynamic_removal.enable").as_bool();
+
+  nh->declare_parameter<int>("dynamic_removal.method", 0);
+  dynamic_remove_config.method = nh->get_parameter("dynamic_removal.method").as_int();
+
+  nh->declare_parameter<bool>("dynamic_removal.isolated_removal", false);
+  dynamic_remove_config.isolated_removal = nh->get_parameter("dynamic_removal.isolated_removal").as_bool();
+
+  nh->declare_parameter<double>("dynamic_removal.grid_size", 0.2);
+  dynamic_remove_config.grid_size = static_cast<float>(nh->get_parameter("dynamic_removal.grid_size").as_double());
+
+  nh->declare_parameter<int>("dynamic_removal.min_neighbors", 2);
+  dynamic_remove_config.min_neighbors = nh->get_parameter("dynamic_removal.min_neighbors").as_int();
+
+  nh->declare_parameter<int>("dynamic_removal.frame_window", 1);
+  dynamic_remove_config.frame_window = nh->get_parameter("dynamic_removal.frame_window").as_int();
+
+  dynamic_remove_config.output_dir = "";  // set dynamically in saveMapCallback
+
+  std::cout << "[SC-PGO] Dynamic removal: "
+            << (dynamic_remove_config.enable ? "ENABLED" : "DISABLED")
+            << ", method=Temporal, window=" << dynamic_remove_config.frame_window
+            << ", grid=" << dynamic_remove_config.grid_size
+            << ", isolated=" << (dynamic_remove_config.isolated_removal ? "on" : "off")
+            << std::endl;
 
   // Loop closure validation parameters
   nh->declare_parameter<double>("max_loop_distance", 100.0);
