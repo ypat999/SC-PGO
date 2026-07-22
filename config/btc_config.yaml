@@ -327,7 +327,8 @@
     max_yaw_diff: 6.28
 
     # odom_direct_threshold: Odom直接验证阈值 (m)
-    #   - 两关键帧 odom 位置差 < odom_direct_threshold 时，跳过BTC直接GICP验证
+    #   - 双重判断：原始odom和PGO优化后的odom，只要有一个距离 < 阈值即可
+    #   - 跳过BTC直接GICP验证
     #   - 适用场景：首尾帧回环、近距离重访场景
     #   - 小值 (2.0): 只对极近距离帧直接验证（减少误检）
     #   - 大值 (5.0): 对较近距离帧直接验证（提高召回率）

@@ -1015,14 +1015,16 @@ void performSCLoopClosure(void) {
 
   // ===== Odom Direct 验证: odom距离<阈值时直接GICP，跳过BTC =====
   // odom_only 和 btc 模式都支持 Odom Direct 验证
+  // 使用双重判断：原始odom和PGO优化后的odom，只要有一个符合阈值即可
   if (use_gicp_for_loop_closure && odom_direct_threshold > 0) {
     mKF.lock();
     Pose6D curr_pose = keyframePoses[curr_frame_id];
+    Pose6D curr_pose_updated = keyframePosesUpdated[curr_frame_id];
     auto curr_cloud = keyframeLaserClouds[curr_frame_id];
     mKF.unlock();
 
     int skip_near = btcManager.config_setting_.skip_near_num_;
-    
+
     // 第一阶段：收集所有候选帧（仅距离+角度初筛，不做GICP）
     struct LoopCandidate {
       int frame_id;
@@ -1031,18 +1033,27 @@ void performSCLoopClosure(void) {
       Eigen::Matrix4d init_guess;
     };
     std::vector<LoopCandidate> candidates;
-    
+
     for (int j = curr_frame_id - skip_near - 1; j >= 0; j--) {
       mKF.lock();
       Pose6D prev_pose = keyframePoses[j];
+      Pose6D prev_pose_updated = keyframePosesUpdated[j];
       mKF.unlock();
 
+      // 计算原始odom距离
       double dx = curr_pose.x - prev_pose.x;
       double dy = curr_pose.y - prev_pose.y;
       double dz = curr_pose.z - prev_pose.z;
       double odom_dist = sqrt(dx*dx + dy*dy + dz*dz);
 
-      if (odom_dist > odom_direct_threshold) continue;
+      // 计算PGO优化后的odom距离
+      double dx_updated = curr_pose_updated.x - prev_pose_updated.x;
+      double dy_updated = curr_pose_updated.y - prev_pose_updated.y;
+      double dz_updated = curr_pose_updated.z - prev_pose_updated.z;
+      double odom_dist_updated = sqrt(dx_updated*dx_updated + dy_updated*dy_updated + dz_updated*dz_updated);
+
+      // 双重判断：原始odom或PGO优化后的odom，只要有一个符合阈值即可
+      if (odom_dist > odom_direct_threshold && odom_dist_updated > odom_direct_threshold) continue;
 
       double yaw_diff = fabs(curr_pose.yaw - prev_pose.yaw);
       if (yaw_diff > max_yaw_diff) continue;
