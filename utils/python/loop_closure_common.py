@@ -1558,7 +1558,7 @@ class OfflineLoopCloser:
         marker_array.markers.append(
             _make_sphere(p_curr, (0.0, 1.0, 0.0, 1.0), base_id + 1))
 
-        # Marker 3: connecting line (yellow LINE_LIST with 2 points)
+        # Marker 3: connecting line (cyan LINE_LIST with 2 points)
         m_line = RosMarker()
         m_line.header.frame_id = frame_id
         m_line.header.stamp = now
@@ -1567,9 +1567,9 @@ class OfflineLoopCloser:
         m_line.type = RosMarker.LINE_LIST
         m_line.action = RosMarker.ADD
         m_line.scale.x = 0.05  # line width
-        m_line.color.r = 1.0
+        m_line.color.r = 0.0
         m_line.color.g = 1.0
-        m_line.color.b = 0.0
+        m_line.color.b = 1.0
         m_line.color.a = 1.0
         m_line.pose.orientation.w = 1.0
         from geometry_msgs.msg import Point as RosPoint
