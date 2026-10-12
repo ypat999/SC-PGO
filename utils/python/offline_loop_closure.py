@@ -4,8 +4,7 @@ Super-LIO 离线回环检测工具 (BTC + GICP)
 
 **只使用C++ BTC实现**：算法与在线版本完全一致，性能提升100倍。
 
-读取 odom_poses.txt（KITTI 格式）和 Scans/*.pcd 文件，
-执行与在线版本相同的流程:
+读取数据并执行与在线版本相同的流程:
   1. 关键帧选择 (keyframeMeterGap / keyframeRadGap)
   2. BTC 描述子生成 + 数据库构建 (C++ BtcDescManager)
   3. 回环检测 (SearchLoop: candidate_selector + candidate_verify)
@@ -13,12 +12,25 @@ Super-LIO 离线回环检测工具 (BTC + GICP)
   5. 回环验证
   6. ISAM2 位姿图优化
 
+支持两种输入格式 (--data-format auto 自动识别):
+  - KITTI:     odom_poses.txt (每行12列) + Scans/000000.pcd
+  - Super-LIO: 同目录下成对的 scans_*.pcd + scans_*.txt
+               pcd 为世界系累积点云(原点=程序起点)，txt 为
+               "timestamp tx ty tz qx qy qz qw"；内部自动转换到 body 系
+
 输出文件：
   - optimized_poses.txt  : KITTI 格式优化后的轨迹
   - loop_pairs.txt       : 检测到的回环对
 
 用法：
+  source /opt/ros/humble/setup.bash
+  export PYTHONPATH=/home/ywj/.local/np1_legacy:$PYTHONPATH
   python3 offline_loop_closure.py --btc-config ../../config/btc_config.yaml --ros2 --ros2-keep-alive --num-threads 4 --merge-n 10  --debug-btc
+
+  # 处理 Super-LIO 原生格式数据 (自动识别)
+  source /opt/ros/humble/setup.bash
+  export PYTHONPATH=/home/ywj/.local/np1_legacy:$PYTHONPATH
+  python3 offline_loop_closure.py /home/ywj/slam_data/PCD/ --btc-config ../../config/btc_config.yaml --merge-n 1 --num-threads 6 --ros2 --ros2-keep-alive 
 """
 
 import os
@@ -53,8 +65,19 @@ def parse_args():
     parser.add_argument("data_dir", nargs="?", default="/home/ywj/save_data/",
                         help="数据目录 (默认: /home/ywj/save_data/)")
 
+    parser.add_argument("--data-format", type=str, default="auto",
+                        choices=["auto", "kitti", "superlio"],
+                        help="输入数据格式: auto=自动识别 | kitti=odom_poses.txt+Scans/ | "
+                             "superlio=同目录 scans_*.pcd+scans_*.txt 成对 (默认: auto)")
+    parser.add_argument("--scan-prefix", type=str, default="",
+                        help="superlio 格式的点云文件名前缀 (多雷达区分, 默认: 空)")
+
     parser.add_argument("--btc-config", type=str, default="../../config/btc_config.yaml",
                         help="统一配置文件路径，包含BTC+GICP+关键帧+验证参数 (默认: 使用内置默认值)")
+
+    parser.add_argument("--use-method", type=str, default="auto",
+                        choices=["auto", "btc", "sc", "odom_only"],
+                        help="回环检测方法: auto=读取配置文件 (默认: auto)")
 
     # 关键帧参数 (对应 launch 文件中的 keyframe_meter_gap)
     parser.add_argument("--keyframe-gap", type=float, default=1.0,
@@ -95,6 +118,11 @@ def parse_args():
     # 多帧合并参数 (针对点云稀疏的雷达如 Mid360)
     parser.add_argument("--merge-n", type=int, default=10,
                         help="每N帧合并为一帧，提升点云密度 (默认: 1, 不合并)。Mid360推荐10")
+
+    # 回环匹配点云融合输出 (仅目视检查用，占磁盘，默认关闭)
+    parser.add_argument("--save-fused-scans", action="store_true",
+                        help="输出回环匹配点云融合PCD到 FusedScans/ (默认关闭；"
+                             "该输出为两帧叠加，长时间运行会占用大量磁盘)")
 
     # ROS2 可视化输出（用于在 RViz 中比较 PGO 效果）
     parser.add_argument("--ros2", action="store_true", default=True,
@@ -153,10 +181,9 @@ def main():
 def _run_offline_loop_closure(args, ros_node):
     """实际的离线回环检测流程，便于在 ROS2 初始化/清理的 try-finally 中调用"""
     # 检查C++ BTC模块（由 loop_closure_common 管理导入，其导入顺序为 rclpy→btc_cpp）
+    # 注意: odom_only / sc 模式不依赖 btc_cpp，缺失时仅提示
     if not HAS_BTC_CPP:
-        print("[ERROR] C++ BTC模块未安装，请先编译btc_cpp模块")
-        print("[ERROR] 解决方案: 见 BTC_CPP_BINDING_BUILD.md")
-        return 1
+        print("[WARN] C++ BTC模块未安装（BTC方法不可用；odom_only/sc 方法不受影响）")
 
     # 从统一配置文件加载参数（CLI 可覆盖）
     btc_config_path = args.btc_config
@@ -184,6 +211,20 @@ def _run_offline_loop_closure(args, ros_node):
         max_yaw_diff = cfg['max_yaw_diff']
         odom_direct_threshold = cfg.get('odom_direct_threshold', 3.0)
         skip_near_num = cfg.get('skip_near_num', 5)  # 新增
+        use_method = cfg.get('use_method', 'btc')
+        save_fused_scans = cfg.get('save_fused_scans', False)
+        # 多楼层误回环治理
+        loop_z_gate = cfg.get('loop_z_gate', 1.2)
+        loop_robust_kernel = cfg.get('loop_robust_kernel', 'huber')
+        loop_robust_k = cfg.get('loop_robust_k', 0.0)
+        enable_pcm = cfg.get('enable_pcm', False)
+        pcm_pos_thres = cfg.get('pcm_pos_thres', 1.5)
+        pcm_rot_thres = cfg.get('pcm_rot_thres', 0.2)
+        cross_floor_enabled = cfg.get('cross_floor_enabled', False)
+        cross_floor_max_dz = cfg.get('cross_floor_max_dz', 4.0)
+        cross_floor_far_dist = cfg.get('cross_floor_far_dist', 20.0)
+        cross_floor_min_pts = cfg.get('cross_floor_min_pts', 100)
+        cross_floor_fitness_thres = cfg.get('cross_floor_fitness_thres', 0.5)
     else:
         btc_config_file = args.btc_config
         gicp_config = GICPConfig()
@@ -195,6 +236,24 @@ def _run_offline_loop_closure(args, ros_node):
         max_yaw_diff = args.max_yaw_diff
         odom_direct_threshold = getattr(args, 'odom_direct_threshold', 3.0)
         skip_near_num = getattr(args, 'skip_near_num', 5)  # 新增
+        use_method = 'btc'
+        save_fused_scans = False
+        loop_z_gate = 1.2
+        loop_robust_kernel = 'huber'
+        loop_robust_k = 0.0
+        enable_pcm = False
+        pcm_pos_thres = 1.5
+        pcm_rot_thres = 0.2
+        cross_floor_enabled = False
+        cross_floor_max_dz = 4.0
+        cross_floor_far_dist = 20.0
+        cross_floor_min_pts = 100
+        cross_floor_fitness_thres = 0.5
+
+    # CLI 覆盖检测方法
+    if args.use_method != 'auto':
+        use_method = args.use_method
+    print(f"[Method] 回环检测方法: {use_method}")
 
     # CLI 覆盖 GICP 参数（手动调参用）
     if args.gicp_fitness_thres != 0.3 or args.gicp_max_dist != 3.0 or \
@@ -215,11 +274,16 @@ def _run_offline_loop_closure(args, ros_node):
         odom_direct_threshold = args.odom_direct_threshold
     if hasattr(args, 'skip_near_num') and args.skip_near_num is not None:
         skip_near_num = args.skip_near_num
+    # CLI 覆盖：显式指定 --save-fused-scans 时强制开启
+    if args.save_fused_scans:
+        save_fused_scans = True
+    print(f"[Output] 回环匹配点云融合PCD输出(FusedScans): "
+          f"{'开启' if save_fused_scans else '关闭'}")
 
     # 创建离线回环检测器（只使用C++ BTC）
     closer = OfflineLoopCloser(
         data_dir=args.data_dir,
-        btc_config_file=btc_config_path,  # 使用解析后的路径
+        btc_config_file=btc_config_file,  # 转换后的 C++ 可读配置路径
         gicp_config=gicp_config,
         keyframe_meter_gap=keyframe_meter_gap,
         keyframe_deg_gap=keyframe_deg_gap,
@@ -230,9 +294,24 @@ def _run_offline_loop_closure(args, ros_node):
         max_yaw_diff=max_yaw_diff,
         odom_direct_threshold=odom_direct_threshold,
         skip_near_num=skip_near_num,  # 新增
+        use_method=use_method,
         merge_n=args.merge_n,
         num_threads=args.num_threads,
-        ros_node=ros_node
+        ros_node=ros_node,
+        data_format=args.data_format,
+        scan_prefix=args.scan_prefix,
+        save_fused_scans=save_fused_scans,
+        loop_z_gate=loop_z_gate,
+        loop_robust_kernel=loop_robust_kernel,
+        loop_robust_k=loop_robust_k,
+        enable_pcm=enable_pcm,
+        pcm_pos_thres=pcm_pos_thres,
+        pcm_rot_thres=pcm_rot_thres,
+        cross_floor_enabled=cross_floor_enabled,
+        cross_floor_max_dz=cross_floor_max_dz,
+        cross_floor_far_dist=cross_floor_far_dist,
+        cross_floor_min_pts=cross_floor_min_pts,
+        cross_floor_fitness_thres=cross_floor_fitness_thres,
     )
 
     # 打印BTC配置参数
@@ -245,11 +324,15 @@ def _run_offline_loop_closure(args, ros_node):
         pass
 
     # 加载数据
+    import time as _time
+    _t_load0 = _time.perf_counter()
     if not closer.load_data():
         print("[ERROR] 数据加载失败")
         return 1
+    print(f"  [Timing] 数据加载: {_time.perf_counter() - _t_load0:.2f}s")
 
     # 执行回环检测 + 优化
+    _t_total0 = _time.perf_counter()
     try:
         optimized_poses = closer.run()
     except Exception:
@@ -257,6 +340,7 @@ def _run_offline_loop_closure(args, ros_node):
         traceback.print_exc()
         print("\n[ERROR] closer.run() 发生异常，跳过优化结果输出")
         return 1
+    print(f"\n[Timing] 全流程墙钟时间: {_time.perf_counter() - _t_total0:.2f}s")
 
     if optimized_poses is not None:
         print(f"\n[DONE] 优化完成, {len(optimized_poses)} 个关键帧位姿")

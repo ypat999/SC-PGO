@@ -118,7 +118,7 @@
     #   - 过小: 只用近处点 → 描述子不稳定（近处点噪声大）
     #   - 过大: 用远处点 → 描述子稳定但计算慢
     proj_dis_min: 0.0
-    proj_dis_max: 10.0
+    proj_dis_max: 50.0
 
     # proj_image_resolution: 投影图像分辨率 (m/pixel)
     #   - 投影平面划分为网格，网格大小 = resolution
@@ -182,13 +182,13 @@
     #   - 避免：相邻帧（真实运动很小）被误认为回环
     #   - 小值 (2): 允许短距离回环（室内小场景）
     #   - 大值 (10): 只允许长距离回环（室外大场景）
-    skip_near_num: 20
+    skip_near_num: 0
 
     # candidate_num: 候选帧数量阈值
     #   - 候选帧投票数 > candidate_num 才进入验证阶段
     #   - 小值 (10): 候选多 → 回环召回高但验证慢
     #   - 大值 (50): 候选少 → 快但可能漏回环
-    candidate_num: 3
+    candidate_num: 1
 
     # rough_dis_threshold: 粗匹配距离阈值（相对值）
     #   - 两BTC三角形边长差 < rough_dis_threshold * 边长 才算匹配
@@ -316,7 +316,7 @@
     # max_loop_distance: 最大回环距离 (m)
     #   - 两关键帧 odom 位置差 < max_loop_distance 才可能是回环
     #   - 用于过滤明显错误的BTC匹配
-    max_loop_distance: 10.0
+    max_loop_distance: 30.0
 
     # max_yaw_diff: 最大偏航角差 (rad)
     #   - 两关键帧 odom 偏航角差 < max_yaw_diff 才可能是回环
@@ -334,14 +334,87 @@
     #   - 大值 (5.0): 对较近距离帧直接验证（提高召回率）
     #   - ⚠️ 配合 skip_near_num 使用，避免邻近帧误检
     #   - ⚠️ 建议降低到1.5以减少无效GICP尝试，加快遍历速度
-    odom_direct_threshold: 2.0
+    odom_direct_threshold: 20.0
+
+    # ================================================================================
+    # 多楼层误回环治理（Multi-floor Loop Guard）
+    # ================================================================================
+    # 场景：多层建筑中，连接不同楼层的楼梯外观几乎一致且半封闭，
+    #       3D 距离很近 → 被 GICP 误配成同一地点 → PGO 回环扭曲。
+    # 关键：GICP 自身无法区分，能提供判断的是 odom 的高度(z)。
+
+    # loop_z_gate: 层高门控阈值 (m)
+    #   - 候选对 |z_i - z_j| > loop_z_gate 时按【跨楼层】剔除，不参与回环
+    #   - 应取 小于楼层净高、大于同层内正常高度波动 的值
+    #   - 楼层净高 ≈ 3.0m 时，推荐 1.2 ~ 2.0
+    #   - <= 0 表示关闭该门控
+    loop_z_gate: 1.2
+
+    # loop_robust_kernel: 回环因子鲁棒核（抑制离群回环对 PGO 的拉扯）
+    #   - 'huber': 温和，默认，适合少量离群
+    #   - 'cauchy': 更强，对残差大的误回环降权更狠（多楼层误回环推荐）
+    #   - 'none' : 关闭鲁棒核（退化为普通高斯噪声模型）
+    loop_robust_kernel: "cauchy"
+
+    # loop_robust_k: 鲁棒核尺度参数 k
+    #   - <= 0 时使用核的默认值（Huber≈1.345, Cauchy≈1.0）
+    #   - 越小越激进（超过 k 倍的残差被强降权）
+    loop_robust_k: 0.0
+
+    # enable_pcm: 回环一致性校验 PCM (Pairwise Consistency Maximization)
+    #   - 优化前，以 odom 链为参考检查两回环闭合残差是否自洽
+    #     T1 · O(b→c) · T2 · O(d→a) ≈ I
+    #   - 贪心保留最大一致子集，剔除与群体冲突的孤立误回环
+    #   - 需要 >= 3 条回环才生效
+    enable_pcm: true
+
+    # pcm_pos_thres: PCM 平移一致性阈值 (m)
+    #   - 两条回环推导出的相对位移残差 < 此值才算一致
+    pcm_pos_thres: 1.5
+
+    # pcm_rot_thres: PCM 旋转一致性阈值 (rad)
+    #   - 两条回环推导出的相对旋转残差 < 此值才算一致
+    pcm_rot_thres: 0.2
+
+    # --------------------------------------------------------------------------------
+    # 跨楼层景观约束（Cross-floor Scenery Constraint）
+    # --------------------------------------------------------------------------------
+    # 目的：不同楼层的点云，通过窗外共同的远景修正层间相对位姿；
+    #       但绝不当作同一层楼的回环（不会把两帧拉到同一高度）。
+    # 做法：对 |dz| ∈ (loop_z_gate, cross_floor_max_dz] 的候选，
+    #       仅用距传感器 > cross_floor_far_dist 的远点（窗外/远景）做 GICP，
+    #       避免被外观相似的楼梯/走廊带偏；结果作为完整 6-DOF 约束加入位姿图。
+
+    # cross_floor_enabled: 是否启用跨楼层景观约束
+    #   - false: 跨楼层候选一律按误回环剔除（仅保留 z-gate 行为）
+    #   - true : 跨楼层候选进入远点 GICP 验证通道
+    cross_floor_enabled: true
+
+    # cross_floor_max_dz: 允许的跨楼层 |dz| 上限 (m)
+    #   - 楼层净高≈3.0m，超过一层(3m)仍可能是相邻楼层看到的共同景观
+    #   - 超过此值视为跨了多层且无共同景观，直接剔除
+    cross_floor_max_dz: 30.0
+
+    # cross_floor_far_dist: 远点距离判据 (m)
+    #   - 只保留距传感器 > 此值的点参与跨楼层对齐
+    #   - 半封闭楼梯的近处结构会被滤掉，只剩窗外远景作为共同参考
+    #   - 越小保留的远点越多(更容易命中)，但可能混入楼梯自身结构
+    cross_floor_far_dist: 5.0
+
+    # cross_floor_min_pts: 每个点云最少远点数
+    #   - 远点太少说明该帧没有可用的窗外景观，跳过跨楼层约束
+    cross_floor_min_pts: 20
+
+    # cross_floor_fitness_thres: 跨楼层对的 GICP fitness 阈值
+    #   - 仅对远点子集计算，需比全点云阈值更宽松
+    cross_floor_fitness_thres: 0.9
 
     # max_gicp_candidates: 每次回环检测最多GICP匹配的候选帧数
     #   - 收集所有候选后按距离排序，只取前N帧进行GICP验证
     #   - 适用于Odom Direct和BTC两种回环方式
     #   - 小值 (3): 快速验证，适合在线实时场景
     #   - 大值 (10): 充分验证，适合离线建图场景
-    max_gicp_candidates: 1
+    max_gicp_candidates: 10
 
     # ================================================================================
     # GICP 配置（Point-to-Plane ICP 精化）
@@ -370,7 +443,7 @@
 
     # gicp_max_iterations: 精配准最大迭代次数
     #   - 迭代次数上限，防止不收敛时无限循环
-    gicp_max_iterations: 64
+    gicp_max_iterations: 34
 
     # gicp_transformation_epsilon: 收敛精度（变换增量阈值）
     #   - 变换增量 < 此阈值时停止迭代（收敛）
@@ -414,12 +487,22 @@
     map_filename: "test.pcd"
 
     # ================================================================================
+    # 输出配置
+    # ================================================================================
+    # save_fused_scans: 是否输出回环匹配点云的融合PCD到数据目录下的 FusedScans/
+    #   - false: 默认关闭。该输出会把匹配的两帧点云叠加写出(点云翻倍)，
+    #            长时间/大规模运行会迅速占用大量磁盘，仅在需要目视检查匹配效果时开启
+    #   - true:  输出 <tag>_fitX_ovlX_prev_to_curr_{gicp,odom}.pcd，
+    #            可用 CloudCompare 按 intensity 着色检查匹配质量
+    save_fused_scans: false
+
+    # ================================================================================
     # 动态物体去除配置（Dynamic Object Removal）
     # ================================================================================
     # 在保存地图时，先过滤动态点，保存逐帧中间PCD文件，再合并生成最终地图
 
     # 是否启用动态物体去除功能
-    dynamic_removal.enable: true
+    dynamic_removal.enable: false
     # 动态物体去除方法: 0 = Temporal (时序方法，基于多帧一致性检测)
     dynamic_removal.method: 0
     # 是否启用离散点滤除（孤立点移除）

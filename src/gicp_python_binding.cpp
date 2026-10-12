@@ -24,8 +24,15 @@
 #include <stdexcept>
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 
 namespace py = pybind11;
+
+// ==================== 计时辅助 ====================
+using GicpClock = std::chrono::steady_clock;
+static inline double ms_since(const GicpClock::time_point& t0) {
+    return std::chrono::duration<double, std::milli>(GicpClock::now() - t0).count();
+}
 
 // ==================== NaN安全的KdTree搜索类 ====================
 // 继承 pcl::search::KdTree，重写 nearestKSearch 和 radiusSearch 虚函数，
@@ -230,7 +237,9 @@ public:
     py::dict alignTwoStage(py::array_t<float> source_array, py::array_t<float> target_array,
                            py::array_t<double> initial_guess_array,
                            double coarse_ds_size, int coarse_max_iter, double coarse_max_dist,
-                           int fine_max_iter, double fine_max_dist) {
+                           int fine_max_iter, double fine_max_dist,
+                           bool compute_overlap = true) {
+        auto t_total0 = GicpClock::now();
         auto source_cloud = numpy_to_pcl(source_array);
         auto target_cloud = numpy_to_pcl(target_array);
 
@@ -276,6 +285,7 @@ public:
         // ===== 阶段1: 粗配准 (下采样) =====
         auto src_ds = pcl::PointCloud<pcl::PointXYZI>::Ptr(new pcl::PointCloud<pcl::PointXYZI>);
         auto tgt_ds = pcl::PointCloud<pcl::PointXYZI>::Ptr(new pcl::PointCloud<pcl::PointXYZI>);
+        auto t_vox0 = GicpClock::now();
         {
             pcl::VoxelGrid<pcl::PointXYZI> voxel;
             voxel.setLeafSize(coarse_ds_size, coarse_ds_size, coarse_ds_size);
@@ -286,6 +296,7 @@ public:
         }
         src_ds = removeInvalidPoints(src_ds);
         tgt_ds = removeInvalidPoints(tgt_ds);
+        double vox_ms = ms_since(t_vox0);
 
         std::cout << "[GICP_OMP] 粗配准: " << src_ds->size() << " vs " << tgt_ds->size()
                   << " pts (ds=" << coarse_ds_size << "m)" << std::endl;
@@ -304,6 +315,7 @@ public:
         coarse_gicp->setInputTarget(tgt_ds);
 
         pcl::PointCloud<pcl::PointXYZI>::Ptr tmp(new pcl::PointCloud<pcl::PointXYZI>);
+        auto t_coarse0 = GicpClock::now();
         try {
             coarse_gicp->align(*tmp, initial_guess);
         } catch (const std::exception &e) {
@@ -314,10 +326,14 @@ public:
             result["fitness_score"] = 1e9;
             return result;
         }
+        double coarse_ms = ms_since(t_coarse0);
+        int coarse_iters = coarse_gicp->nr_iterations_;
 
         Eigen::Matrix4f T_coarse = coarse_gicp->getFinalTransformation();
         std::cout << "[GICP_OMP] 粗配准: converged=" << (coarse_gicp->hasConverged() ? "true" : "false")
-                  << ", fitness=" << coarse_gicp->getFitnessScore() << std::endl;
+                  << ", fitness=" << coarse_gicp->getFitnessScore()
+                  << ", 耗时=" << coarse_ms << "ms"
+                  << ", 迭代=" << coarse_iters << std::endl;
 
         // ===== 阶段2: 精配准 =====
         auto fine_gicp = GicpOmp::Ptr(new GicpOmp());
@@ -334,6 +350,7 @@ public:
         fine_gicp->setInputTarget(target_cloud);
 
         pcl::PointCloud<pcl::PointXYZI>::Ptr output(new pcl::PointCloud<pcl::PointXYZI>);
+        auto t_fine0 = GicpClock::now();
         try {
             fine_gicp->align(*output, T_coarse);
         } catch (const std::exception &e) {
@@ -344,6 +361,8 @@ public:
             result["fitness_score"] = 1e9;
             return result;
         }
+        double fine_ms = ms_since(t_fine0);
+        int fine_iters = fine_gicp->nr_iterations_;
 
         Eigen::Matrix4f final_T = fine_gicp->getFinalTransformation();
         bool converged = fine_gicp->hasConverged();
@@ -351,9 +370,10 @@ public:
         double fitness = fine_gicp->getFitnessScore(1.0);
         double fitness_all = fine_gicp->getFitnessScore();
 
-        // 计算overlap ratio（<=1m内点比例）
+        // 计算overlap ratio（<=1m内点比例）— 仅在需要时计算（需再建一棵KDTree+全量近邻搜索）
         double overlap_ratio = 0.0;
-        {
+        auto t_ov0 = GicpClock::now();
+        if (compute_overlap) {
             pcl::PointCloud<pcl::PointXYZI>::Ptr src_trans(new pcl::PointCloud<pcl::PointXYZI>);
             pcl::transformPointCloud(*source_cloud, *src_trans, final_T);
             auto overlap_kdtree = std::make_shared<NaNCheckedKdTree>();
@@ -369,6 +389,7 @@ public:
             }
             overlap_ratio = static_cast<double>(inlier_count) / src_trans->size();
         }
+        double ov_ms = ms_since(t_ov0);
 
         Eigen::Matrix4d T_double = final_T.cast<double>();
         double final_disp = T_double.block<3,1>(0,3).norm();
@@ -376,13 +397,23 @@ public:
                   << ", fitness(1m)=" << fitness
                   << ", fitness(all)=" << fitness_all
                   << ", overlap(1m)=" << (overlap_ratio * 100) << "%"
-                  << ", final_disp=" << final_disp << "m" << std::endl;
+                  << ", final_disp=" << final_disp << "m"
+                  << ", 耗时=" << fine_ms << "ms"
+                  << ", 迭代=" << fine_iters << std::endl;
+
+        double total_ms = ms_since(t_total0);
+        std::cout << "[GICP_OMP] 阶段耗时: 体素=" << vox_ms << "ms 粗配准=" << coarse_ms
+                  << "ms 精配准=" << fine_ms << "ms overlap=" << ov_ms
+                  << "ms 合计=" << total_ms << "ms (" << coarse_iters << "+"
+                  << fine_iters << " iter)" << std::endl;
 
         py::dict result;
         result["transformation"] = T_double;
         result["has_converged"] = converged;
         result["fitness_score"] = fitness;
         result["overlap_ratio"] = overlap_ratio;
+        result["iterations"] = fine_iters;             // 精配准迭代次数
+        result["coarse_iterations"] = coarse_iters;    // 粗配准迭代次数
         return result;
     }
 
@@ -450,7 +481,8 @@ PYBIND11_MODULE(gicp_omp_cpp, m) {
              py::arg("coarse_max_iter") = 50,
              py::arg("coarse_max_dist") = 3.0,
              py::arg("fine_max_iter") = 200,
-             py::arg("fine_max_dist") = 2.0)
+             py::arg("fine_max_dist") = 2.0,
+             py::arg("compute_overlap") = true)
         .def("getConfig", &PyGicpOmpManager::getConfig,
              "获取当前GICP配置参数");
 }

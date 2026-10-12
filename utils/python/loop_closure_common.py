@@ -11,6 +11,8 @@
 """
 
 import os
+import re
+import time
 import concurrent.futures
 import threading
 import numpy as np
@@ -109,9 +111,133 @@ class GICPResult:
         self.fitness_score = float('inf')      # mean_inlier_dist (m)，越小越好
         self.overlap_ratio = 0.0               # 0~1，越大越好
         self.num_iterations = 0
+        self.coarse_iterations = 0
 
 
-def gicp_align(source_pts, target_pts, initial_guess=None, config=None):
+class _GicpStats:
+    """GICP 调用次数/耗时统计（线程安全），用于离线性能诊断"""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.reset()
+
+    def reset(self):
+        with self._lock:
+            self.calls = 0
+            self.total_s = 0.0
+            self.max_s = 0.0
+            self.src_pts_total = 0
+            self.tgt_pts_total = 0
+            self.by_tag = {}          # tag -> {'calls':int, 'total_s':float}
+            self.hist = []            # 明细: (耗时s, tag, src_pts, tgt_pts)
+            self.record_detail = True
+
+    def add(self, dt, tag, n_src, n_tgt, iters=0, success=False):
+        with self._lock:
+            self.calls += 1
+            self.total_s += dt
+            if dt > self.max_s:
+                self.max_s = dt
+            self.src_pts_total += n_src
+            self.tgt_pts_total += n_tgt
+            e = self.by_tag.setdefault(tag, {'calls': 0, 'total_s': 0.0})
+            e['calls'] += 1
+            e['total_s'] += dt
+            if self.record_detail:
+                self.hist.append((dt, tag, n_src, n_tgt, iters, success))
+
+    def snapshot(self):
+        """返回 (调用次数, 累计耗时s)，供运行中实时打印"""
+        with self._lock:
+            return self.calls, self.total_s
+
+    def report(self, title="GICP 耗时统计"):
+        with self._lock:
+            print(f"\n  ----- {title} -----")
+            if self.calls == 0:
+                print("  无 GICP 调用")
+                return
+            print(f"  调用总次数   : {self.calls}")
+            print(f"  总计耗时     : {self.total_s:.2f}s")
+            print(f"  平均单次     : {self.total_s / self.calls:.3f}s")
+            print(f"  最慢单次     : {self.max_s:.3f}s")
+            print(f"  平均点云规模 : src={self.src_pts_total / self.calls:.0f}, "
+                  f"tgt={self.tgt_pts_total / self.calls:.0f}")
+            for tag, e in sorted(self.by_tag.items(), key=lambda kv: -kv[1]['total_s']):
+                print(f"    - {tag:<12}: {e['calls']:>5} 次, {e['total_s']:>9.2f}s "
+                      f"(均 {e['total_s'] / e['calls']:.3f}s)")
+            if self.hist:
+                print("  最慢的 5 次:")
+                for dt, tag, n_src, n_tgt, iters, succ in sorted(self.hist, reverse=True)[:5]:
+                    print(f"    {dt:>7.3f}s  {tag:<12} src={n_src:>7} tgt={n_tgt:>7} "
+                          f"iter={iters:>4} {'OK' if succ else 'FAIL'}")
+                self._report_iterations()
+
+    def _report_iterations(self):
+        """按 成功/失配 分组的精配准迭代次数分布，用于确定 fine_max_iter 上限"""
+        ok = [h[4] for h in self.hist if h[5]]
+        bad = [h[4] for h in self.hist if not h[5]]
+        print("  精配准迭代次数分布 (成功匹配 vs 失配):")
+        for name, arr in (("成功匹配", ok), ("失配", bad)):
+            if not arr:
+                print(f"    - {name}: 无")
+                continue
+            a = np.array(arr, dtype=np.int32)
+            print(f"    - {name}: n={len(arr):<4} min={a.min():<4} "
+                  f"中位={int(np.median(a)):<4} p90={int(np.percentile(a, 90)):<4} max={a.max()}")
+        if ok:
+            print(f"    => 建议 gicp_max_iterations ≈ {max(ok) + 2} "
+                  f"(成功匹配最大 {max(ok)} + 余量；超过的失配迭代属于过度计算)")
+
+
+GICP_STATS = _GicpStats()
+
+
+# ---- GICP_OMP Manager 单例（避免每次配准都重新构造 Manager 并打印"初始化完成"）----
+# alignTwoStage 内部为每次调用单独创建 coarse/fine GICP 对象（线程安全），
+# Manager 自身仅持有只读的配置标量，可安全跨线程共享，因此全局复用一个实例。
+_GICP_MGR = None
+_GICP_MGR_SIG = None
+_GICP_MGR_LOCK = threading.Lock()
+
+
+def _gicp_config_sig(c):
+    """GICPConfig 中与 setConfig 相关的字段签名，用于判断是否需要重新配置"""
+    return (
+        c.max_correspondence_distance, c.transformation_epsilon, c.rotation_epsilon,
+        c.k_correspondences, c.max_optimizer_iterations, c.gicp_epsilon,
+        c.max_iterations, c.num_threads,
+        getattr(c, 'coarse_ds_size', None), getattr(c, 'coarse_max_iter', None),
+        getattr(c, 'coarse_max_dist', None),
+    )
+
+
+def _get_gicp_manager(config):
+    """返回复用的 GicpOmpManager 单例；仅首次或配置变化时调用 setConfig。"""
+    global _GICP_MGR, _GICP_MGR_SIG
+    cfg_dict = {
+        'max_correspondence_distance': config.max_correspondence_distance,
+        'transformation_epsilon': config.transformation_epsilon,
+        'rotation_epsilon': config.rotation_epsilon,
+        'k_correspondences': config.k_correspondences,
+        'max_optimizer_iterations': config.max_optimizer_iterations,
+        'gicp_epsilon': config.gicp_epsilon,
+        'max_iterations': config.max_iterations,
+        'num_threads': config.num_threads,
+    }
+    with _GICP_MGR_LOCK:
+        if _GICP_MGR is None:
+            _GICP_MGR = gicp_omp_cpp.GicpOmpManager()
+            _GICP_MGR.setConfig(cfg_dict)
+            _GICP_MGR_SIG = _gicp_config_sig(config)
+        elif _gicp_config_sig(config) != _GICP_MGR_SIG:
+            _GICP_MGR.setConfig(cfg_dict)
+            _GICP_MGR_SIG = _gicp_config_sig(config)
+        return _GICP_MGR
+
+
+def gicp_align(source_pts, target_pts, initial_guess=None, config=None,
+               compute_overlap=False):
     """
     pclomp GICP_OMP 配准 — 与在线 C++ 定位使用完全相同的 pclomp::GeneralizedIterativeClosestPoint。
 
@@ -123,6 +249,8 @@ def gicp_align(source_pts, target_pts, initial_guess=None, config=None):
     target_pts: Nx3 numpy array (或 Nx4 with intensity)
     initial_guess: 4x4 numpy array
     config: GICPConfig
+    compute_overlap: bool, 是否额外计算 overlap_ratio（需再建一棵KDTree并全量近邻搜索，
+                     仅 save_fused_scans 时才需要，默认关闭以加速）
     返回: GICPResult
     """
     if not HAS_GICP_OMP:
@@ -157,18 +285,7 @@ def gicp_align(source_pts, target_pts, initial_guess=None, config=None):
     result = GICPResult()
 
     try:
-        gicp = gicp_omp_cpp.GicpOmpManager()
-        gicp_config = {
-            'max_correspondence_distance': config.max_correspondence_distance,
-            'transformation_epsilon': config.transformation_epsilon,
-            'rotation_epsilon': config.rotation_epsilon,
-            'k_correspondences': config.k_correspondences,
-            'max_optimizer_iterations': config.max_optimizer_iterations,
-            'gicp_epsilon': config.gicp_epsilon,
-            'max_iterations': config.max_iterations,
-            'num_threads': config.num_threads,
-        }
-        gicp.setConfig(gicp_config)
+        gicp = _get_gicp_manager(config)
 
         res = gicp.alignTwoStage(
             src_nx4, tgt_nx4, initial_guess.astype(np.float64),
@@ -177,12 +294,15 @@ def gicp_align(source_pts, target_pts, initial_guess=None, config=None):
             coarse_max_dist=config.coarse_max_dist,
             fine_max_iter=config.max_iterations,
             fine_max_dist=config.max_correspondence_distance,
+            compute_overlap=compute_overlap,
         )
 
         result.transformation = np.asarray(res['transformation'])
         result.has_converged = bool(res['has_converged'])
         result.fitness_score = float(res['fitness_score'])          # mean_inlier_dist (m)
         result.overlap_ratio = float(res.get('overlap_ratio', 0.0))
+        result.num_iterations = int(res.get('iterations', 0))
+        result.coarse_iterations = int(res.get('coarse_iterations', 0))
 
     except Exception as e:
         print(f"[GICP] 异常: {e}")
@@ -334,7 +454,7 @@ def _interp_rotation_matrix(R1, R2, t):
 
 # ======================== 位姿图优化 (对应 C++ GTSAM ISAM2) ========================
 
-def init_noises():
+def init_noises(loop_kernel='huber', loop_k=0.0):
     """
     对应 C++ initNoises
     返回 (prior_noise, odom_noise, robust_loop_noise, robust_gps_noise)
@@ -343,7 +463,12 @@ def init_noises():
       - prior_noise: 先验噪声极小，固定首个位姿
       - odom_noise: 里程计噪声极小（sigma平移1cm, 旋转0.5°），坚信odom
       - loop_noise: 回环噪声较大（sigma平移1m, 旋转0.5rad），不信任回环
-        配合 Huber 鲁棒核，仅当回环与 odom 高度一致时才起作用
+        配合鲁棒核，仅当回环与 odom 高度一致时才起作用
+
+    loop_kernel: 'huber' | 'cauchy' | 'none'
+      - Huber: 对中等离群稳健，抑制力温和
+      - Cauchy: 对大幅度离群衰减更快，误回环(如多楼层楼梯)抑制更强
+    loop_k: 核函数尺度参数；<=0 时按核类型取默认 (huber=1.345, cauchy=1.0)
     """
     prior_noise = gtsam.noiseModel.Diagonal.Variances(
         np.array([1e-12, 1e-12, 1e-12, 1e-12, 1e-12, 1e-12])
@@ -354,10 +479,18 @@ def init_noises():
     )
     # 不信任回环: sigma平移=1m, sigma旋转=0.5rad
     loop_noise_vector = np.array([1.0, 1.0, 1.0, 0.25, 0.25, 0.25])
-    robust_loop_noise = gtsam.noiseModel.Robust.Create(
-        gtsam.noiseModel.mEstimator.Huber.Create(1.345),
-        gtsam.noiseModel.Diagonal.Variances(loop_noise_vector)
-    )
+    loop_base = gtsam.noiseModel.Diagonal.Variances(loop_noise_vector)
+    _kernel = (loop_kernel or 'none').lower()
+    if _kernel == 'cauchy':
+        _k = loop_k if loop_k > 0 else 1.0
+        robust_loop_noise = gtsam.noiseModel.Robust.Create(
+            gtsam.noiseModel.mEstimator.Cauchy.Create(_k), loop_base)
+    elif _kernel == 'huber':
+        _k = loop_k if loop_k > 0 else 1.345
+        robust_loop_noise = gtsam.noiseModel.Robust.Create(
+            gtsam.noiseModel.mEstimator.Huber.Create(_k), loop_base)
+    else:
+        robust_loop_noise = loop_base
     # GPS noise
     big_noise_tolerant_to_xy = 1e9
     gps_altitude_noise = 250.0
@@ -440,6 +573,22 @@ def _rpy_to_matrix(roll, pitch, yaw):
     return R
 
 
+def _quat_xyzw_to_matrix(qx, qy, qz, qw):
+    """四元数 (x,y,z,w) -> 3x3 旋转矩阵（自动归一化）"""
+    n = np.sqrt(qx*qx + qy*qy + qz*qz + qw*qw)
+    if n < 1e-12:
+        return np.eye(3)
+    qx, qy, qz, qw = qx / n, qy / n, qz / n, qw / n
+    xx, yy, zz = qx*qx, qy*qy, qz*qz
+    xy, xz, yz = qx*qy, qx*qz, qy*qz
+    wx, wy, wz = qw*qx, qw*qy, qw*qz
+    return np.array([
+        [1 - 2*(yy + zz), 2*(xy - wz),     2*(xz + wy)],
+        [2*(xy + wz),     1 - 2*(xx + zz), 2*(yz - wx)],
+        [2*(xz - wy),     2*(yz + wx),     1 - 2*(xx + yy)],
+    ])
+
+
 def _extract_rpy(T):
     """4x4 -> (roll, pitch, yaw)"""
     R = T[:3, :3]
@@ -456,6 +605,126 @@ def _extract_rpy(T):
     return roll, pitch, yaw
 
 
+def _rot_angle_rad(R):
+    """3x3 旋转矩阵 -> 旋转角 (rad)"""
+    c = (np.trace(R) - 1.0) * 0.5
+    return float(np.arccos(np.clip(c, -1.0, 1.0)))
+
+
+def _far_range_points(cloud, far_dist):
+    """提取距传感器原点 > far_dist 的点(窗外/远景)，用于跨楼层共同景观对齐。
+
+    关键帧点云为 body 系，故点范数即为量程。
+    """
+    if cloud is None or len(cloud) == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+    rng = np.linalg.norm(cloud[:, :3], axis=1)
+    return cloud[rng > far_dist]
+
+
+def _is_ros2_param_format(data):
+    """判断 yaml 内容是否为 ROS2 参数格式（/**: ros__parameters: 嵌套）"""
+    return isinstance(data, dict) and '/**' in data
+
+
+# C++ load_config_setting (cv::FileStorage) 需要的 BTC 顶层键
+_BTC_CPP_KEYS = [
+    'useful_corner_num', 'plane_merge_normal_thre', 'plane_merge_dis_thre',
+    'plane_detection_thre', 'voxel_size', 'voxel_init_num', 'proj_plane_num',
+    'proj_image_resolution', 'proj_image_high_inc', 'proj_dis_min',
+    'proj_dis_max', 'summary_min_thre', 'line_filter_enable',
+    'descriptor_near_num', 'descriptor_min_len', 'descriptor_max_len',
+    'non_max_suppression_radius', 'triangle_resolution', 'skip_near_num',
+    'candidate_num', 'rough_dis_threshold', 'similarity_threshold',
+    'icp_threshold', 'normal_threshold', 'dis_threshold',
+    'geom_side_std_threshold', 'geom_center_std_threshold',
+    'ransac_min_vote', 'ransac_max_iterations', 'ransac_sample_max',
+    'ransac_correspondence_dis', 'candidate_selector_min_vote',
+    'candidate_verify_min_pairs', 'icp_point_to_point_max',
+]
+
+
+def _write_btc_cpp_config(ros_params, source_file):
+    """把 ROS2 参数格式中的 BTC 键转写为 OpenCV FileStorage 扁平格式临时文件"""
+    import tempfile
+    lines = ['%YAML:1.0',
+             f'# auto-converted from {source_file} (ROS2 params -> OpenCV flat)']
+    for k in _BTC_CPP_KEYS:
+        if k in ros_params:
+            lines.append(f"{k}: {ros_params[k]}")
+    fd, tmp_path = tempfile.mkstemp(prefix='btc_cpp_flat_', suffix='.yaml')
+    with os.fdopen(fd, 'w') as f:
+        f.write('\n'.join(lines) + '\n')
+    return tmp_path
+
+
+def _ros2_params_to_nested(p):
+    """把 ROS2 扁平参数映射为 load_unified_config 期望的嵌套结构"""
+    gicp = {}
+    gicp_alias = {
+        'fitness_score_threshold': 'gicp_fitness_score_threshold',
+        'max_correspondence_distance': 'gicp_max_correspondence_distance',
+        'max_iterations': 'gicp_max_iterations',
+        'transformation_epsilon': 'gicp_transformation_epsilon',
+        'scan_ds_size': 'gicp_scan_ds_size',
+        'coarse_ds_size': 'gicp_coarse_ds_size',
+        'coarse_max_iter': 'gicp_coarse_max_iter',
+        'coarse_max_dist': 'gicp_coarse_max_dist',
+        'max_init_translation': 'gicp_max_init_translation',
+        'num_threads': 'gicp_num_threads',
+    }
+    for attr, ros_key in gicp_alias.items():
+        if ros_key in p:
+            gicp[attr] = p[ros_key]
+    if 'use_gicp_for_loop_closure' in p:
+        gicp['enabled'] = p['use_gicp_for_loop_closure']
+
+    nested = {'gicp': gicp}
+    if 'skip_near_num' in p:
+        nested['skip_near_num'] = p['skip_near_num']
+
+    sc = {k: p[k] for k in ('use_method', 'sc_dist_thres', 'sc_max_radius') if k in p}
+    if sc:
+        nested['scancontext'] = sc
+
+    kf = {}
+    if 'keyframe_meter_gap' in p:
+        kf['meter_gap'] = p['keyframe_meter_gap']
+    if 'keyframe_deg_gap' in p:
+        kf['deg_gap'] = p['keyframe_deg_gap']
+    if kf:
+        nested['keyframe'] = kf
+
+    lv = {}
+    lv_flat = {
+        'max_loop_distance': 'max_loop_distance',
+        'max_yaw_diff': 'max_yaw_diff',
+        'odom_direct_threshold': 'odom_direct_threshold',
+        'loop_z_gate': 'z_gate',
+        'loop_robust_kernel': 'robust_kernel',
+        'loop_robust_k': 'robust_k',
+        'enable_pcm': 'enable_pcm',
+        'pcm_pos_thres': 'pcm_pos_thres',
+        'pcm_rot_thres': 'pcm_rot_thres',
+        'cross_floor_enabled': 'cross_floor_enabled',
+        'cross_floor_max_dz': 'cross_floor_max_dz',
+        'cross_floor_far_dist': 'cross_floor_far_dist',
+        'cross_floor_min_pts': 'cross_floor_min_pts',
+        'cross_floor_fitness_thres': 'cross_floor_fitness_thres',
+    }
+    for _flat_key, _attr in lv_flat.items():
+        if _flat_key in p:
+            lv[_attr] = p[_flat_key]
+    if lv:
+        nested['loop_validation'] = lv
+
+    out = {k: p[k] for k in ('save_fused_scans',) if k in p}
+    if out:
+        nested['output'] = out
+
+    return nested
+
+
 def load_unified_config(config_file):
     """
     加载统一配置文件（btc + gicp + keyframe + loop_validation 合并为一个 yaml），
@@ -468,6 +737,11 @@ def load_unified_config(config_file):
       - scan_ds_size: float
       - max_loop_distance: float
       - max_yaw_diff: float
+
+    兼容两种格式:
+      - OpenCV FileStorage 扁平/嵌套 YAML（可含 %YAML:1.0 头）
+      - ROS2 参数格式 (/**: ros__parameters: ...)：内部自动转换为
+        Python 嵌套结构 + 临时 OpenCV 扁平文件供 C++ BTC 读取
     """
     with open(config_file, 'r') as f:
         lines = f.readlines()
@@ -477,6 +751,12 @@ def load_unified_config(config_file):
 
     result = {}
     result['btc_config_path'] = config_file
+
+    if _is_ros2_param_format(data):
+        ros_params = (data['/**'] or {}).get('ros__parameters', {}) or {}
+        result['btc_config_path'] = _write_btc_cpp_config(ros_params, config_file)
+        data = _ros2_params_to_nested(ros_params)
+        print(f"[Config] 检测到 ROS2 参数格式，已内部转换: {config_file}")
 
     # GICP 部分 — 从 YAML 读取所有参数，fallback 使用 GICPConfig 默认值（单一数据源）
     gicp_cfg = GICPConfig()
@@ -511,6 +791,24 @@ def load_unified_config(config_file):
     result['max_loop_distance'] = lv.get('max_loop_distance', 100.0)
     result['max_yaw_diff'] = lv.get('max_yaw_diff', np.pi * 0.75)
     result['odom_direct_threshold'] = lv.get('odom_direct_threshold', 3.0)
+    # 多楼层误回环治理
+    result['loop_z_gate'] = lv.get('z_gate', 1.2)
+    result['loop_robust_kernel'] = lv.get('robust_kernel', 'huber')
+    result['loop_robust_k'] = lv.get('robust_k', 0.0)
+    result['enable_pcm'] = lv.get('enable_pcm', False)
+    result['pcm_pos_thres'] = lv.get('pcm_pos_thres', 1.5)
+    result['pcm_rot_thres'] = lv.get('pcm_rot_thres', 0.2)
+    # 跨楼层景观约束
+    result['cross_floor_enabled'] = lv.get('cross_floor_enabled', False)
+    result['cross_floor_max_dz'] = lv.get('cross_floor_max_dz', 4.0)
+    result['cross_floor_far_dist'] = lv.get('cross_floor_far_dist', 20.0)
+    result['cross_floor_min_pts'] = lv.get('cross_floor_min_pts', 100)
+    result['cross_floor_fitness_thres'] = lv.get('cross_floor_fitness_thres', 0.5)
+
+    # 输出部分
+    out_cfg = data.get('output', {})
+    # 是否输出回环匹配点云融合PCD到 FusedScans/（默认关闭，避免占用大量磁盘）
+    result['save_fused_scans'] = out_cfg.get('save_fused_scans', False)
 
     return result
 
@@ -535,7 +833,13 @@ class OfflineLoopCloser:
                  max_loop_distance=100.0, max_yaw_diff=None,
                  odom_direct_threshold=3.0, skip_near_num=5,
                  use_method='btc', sc_dist_thres=0.6, sc_max_radius=80.0,
-                 merge_n=1, num_threads=0, ros_node=None):
+                 merge_n=1, num_threads=0, ros_node=None,
+                 data_format='auto', scan_prefix='', save_fused_scans=False,
+                 loop_z_gate=1.2, loop_robust_kernel='huber', loop_robust_k=0.0,
+                 enable_pcm=False, pcm_pos_thres=1.5, pcm_rot_thres=0.2,
+                 cross_floor_enabled=False, cross_floor_max_dz=4.0,
+                 cross_floor_far_dist=20.0, cross_floor_min_pts=100,
+                 cross_floor_fitness_thres=0.5):
         """
         离线回环检测器 - 支持BTC和ScanContext两种方法
 
@@ -550,7 +854,18 @@ class OfflineLoopCloser:
             num_threads: int, 默认0。多线程加速线程数 (0=自动检测CPU核心数)
             ros_node: rclpy.Node 或 None，若提供则发布 odom_path / optimized_path / loop_match_markers
                       话题用于 RViz 可视化比较 PGO 效果
+            data_format: str, 默认'auto'。数据格式: 'auto' | 'kitti' | 'superlio'
+                         - 'kitti':    odom_poses.txt (KITTI 12列) + Scans/000000.pcd
+                         - 'superlio': Super-LIO 原生格式, 同目录下 scans_*.pcd + scans_*.txt 成对，
+                                       pcd 为世界系累积点云(原点=程序起点)，txt 为
+                                       "timestamp tx ty tz qx qy qz qw"
+            scan_prefix: str, 默认''。superlio 格式的点云文件名前缀(多雷达时区分)
+            save_fused_scans: bool, 默认False。是否输出回环匹配点云的融合PCD到
+                             FusedScans/ 目录（仅供目视检查，点云翻倍输出较占磁盘）
         """
+        self.data_format = data_format
+        self.scan_prefix = scan_prefix
+        self.save_fused_scans = save_fused_scans
         self.data_dir = data_dir or "/home/ywj/save_data/"
         self.debug_btc = debug_btc
         self.merge_n = max(1, int(merge_n))
@@ -568,8 +883,12 @@ class OfflineLoopCloser:
         if HAS_BTC_CPP and use_method == 'btc':
             import btc_cpp
             if btc_config_file and os.path.exists(btc_config_file):
-                self.btc_cpp = btc_cpp.BtcDescManager(btc_config_file)
-                print(f"[BTC] ✓ 使用C++实现 (加载配置): {btc_config_file}")
+                try:
+                    self.btc_cpp = btc_cpp.BtcDescManager(btc_config_file)
+                    print(f"[BTC] ✓ 使用C++实现 (加载配置): {btc_config_file}")
+                except Exception as e:
+                    self.btc_cpp = btc_cpp.BtcDescManager()
+                    print(f"[BTC] ⚠ 配置文件无法被C++ BTC读取 ({e})，回退到内置默认配置")
             else:
                 self.btc_cpp = btc_cpp.BtcDescManager()
                 print("[BTC] ✓ 使用C++实现 (内置默认配置)")
@@ -613,6 +932,29 @@ class OfflineLoopCloser:
         else:
             self.max_yaw_diff = np.pi * 0.75  # 默认 0.75π
             print("[BTC] Python BTC调试日志已开启")
+
+        # 抗多楼层误回环 / 鲁棒后端参数
+        self.loop_z_gate = float(loop_z_gate)          # 层高门控: |dz| 超此值视为跨楼层(<=0 关闭)
+        self.loop_robust_kernel = loop_robust_kernel    # 回环因子鲁棒核: huber|cauchy|none
+        self.loop_robust_k = float(loop_robust_k)       # 核尺度(<=0 用默认)
+        self.enable_pcm = bool(enable_pcm)              # 是否启用回环一致性校验(PCM)
+        self.pcm_pos_thres = float(pcm_pos_thres)       # PCM 平移一致性阈值(m)
+        self.pcm_rot_thres = float(pcm_rot_thres)       # PCM 旋转一致性阈值(rad)
+        # 跨楼层景观约束: 用窗外共同景观修正层间相对位姿(非同一层回环)
+        self.cross_floor_enabled = bool(cross_floor_enabled)
+        self.cross_floor_max_dz = float(cross_floor_max_dz)          # 允许的跨楼层 |dz| 上限(m)
+        self.cross_floor_far_dist = float(cross_floor_far_dist)      # 远点距离判据(m), 窗外景观
+        self.cross_floor_min_pts = int(cross_floor_min_pts)          # 每个点云最少远点数
+        self.cross_floor_fitness_thres = float(cross_floor_fitness_thres)
+        if self.loop_z_gate > 0:
+            print(f"[LoopGuard] 层高门控: |dz| > {self.loop_z_gate}m 的候选按跨楼层剔除")
+        if self.enable_pcm:
+            print(f"[LoopGuard] PCM 一致性校验: 启用 (pos<{self.pcm_pos_thres}m, "
+                  f"rot<{self.pcm_rot_thres}rad)")
+        if self.cross_floor_enabled:
+            print(f"[LoopGuard] 跨楼层景观约束: 启用 (dz∈({self.loop_z_gate}, "
+                  f"{self.cross_floor_max_dz}]m, 远点>{self.cross_floor_far_dist}m "
+                  f"且>={self.cross_floor_min_pts}个, fitness<{self.cross_floor_fitness_thres})")
 
         # GICP 配置
         self.gicp_config = gicp_config or GICPConfig()
@@ -690,9 +1032,12 @@ class OfflineLoopCloser:
                     params['btc_config_content'] = f.read()
             except Exception:
                 pass
-        poses_file = os.path.join(self.data_dir, "odom_poses.txt")
-        if os.path.exists(poses_file):
-            params['poses_mtime'] = os.path.getmtime(poses_file)
+        pairs = self._find_superlio_pairs(self.data_dir)
+        if pairs:
+            params['poses_mtime'] = max(os.path.getmtime(p[1]) for p in pairs)
+        elif os.path.exists(os.path.join(self.data_dir, "odom_poses.txt")):
+            params['poses_mtime'] = os.path.getmtime(
+                os.path.join(self.data_dir, "odom_poses.txt"))
         return params
 
     def _btc_cache_params_match(self):
@@ -726,7 +1071,7 @@ class OfflineLoopCloser:
         os.makedirs(cache_dir, exist_ok=True)
         params = self._btc_cache_params()
         # 不保存 btc_config_content（可能很大）
-        del params['btc_config_content']
+        params.pop('btc_config_content', None)
         with open(os.path.join(cache_dir, "params.json"), 'w') as f:
             json.dump(params, f)
 
@@ -790,10 +1135,33 @@ class OfflineLoopCloser:
         return loaded, ""
 
     def load_data(self, data_dir=None):
-        """加载位姿和点云数据"""
+        """加载位姿和点云数据（自动识别 KITTI 或 Super-LIO 原生格式）"""
         data_dir = data_dir or self.data_dir
 
-        # 加载位姿
+        fmt = self._detect_data_format(data_dir)
+        if fmt == 'kitti':
+            return self._load_data_kitti(data_dir)
+        elif fmt == 'superlio':
+            return self._load_data_superlio(data_dir)
+        else:
+            print(f"[ERROR] 无法识别数据格式: {data_dir}")
+            print("        KITTI:    需要 odom_poses.txt (12列) + Scans/000000.pcd")
+            print("        Super-LIO: 需要成对的 scans_*.pcd + scans_*.txt")
+            return False
+
+    def _detect_data_format(self, data_dir):
+        """识别数据格式: 'kitti' | 'superlio' | None"""
+        if self.data_format and self.data_format != 'auto':
+            return self.data_format
+        if os.path.exists(os.path.join(data_dir, "odom_poses.txt")) and \
+           os.path.isdir(os.path.join(data_dir, "Scans")):
+            return 'kitti'
+        if self._find_superlio_pairs(data_dir):
+            return 'superlio'
+        return None
+
+    def _load_data_kitti(self, data_dir):
+        """加载 KITTI 格式: odom_poses.txt + Scans/000000.pcd"""
         poses_file = os.path.join(data_dir, "odom_poses.txt")
         if not os.path.exists(poses_file):
             print(f"[ERROR] 位姿文件不存在: {poses_file}")
@@ -807,7 +1175,6 @@ class OfflineLoopCloser:
             self.all_scans = []  # _merge_frames 会填充
             return True
 
-        # 加载点云
         scans_dir = os.path.join(data_dir, "Scans")
         if not os.path.isdir(scans_dir):
             print(f"[ERROR] 点云目录不存在: {scans_dir}")
@@ -825,6 +1192,133 @@ class OfflineLoopCloser:
 
         print(f"[Load] 加载了 {len(self.all_scans)} 帧点云")
         return True
+
+    @staticmethod
+    def _trailing_index(filename):
+        """提取文件名末尾数字，用于按帧号排序；无数字返回 None"""
+        stem = os.path.splitext(filename)[0]
+        m = re.search(r'(\d+)$', stem)
+        return int(m.group(1)) if m else None
+
+    def _find_superlio_pairs(self, data_dir):
+        """查找 Super-LIO 原生格式的 scans_*.pcd + scans_*.txt 成对文件"""
+        if not os.path.isdir(data_dir):
+            return []
+        pairs = []
+        for fn in os.listdir(data_dir):
+            if not fn.endswith('.pcd'):
+                continue
+            if self.scan_prefix and not fn.startswith(self.scan_prefix):
+                continue
+            txt_fn = fn[:-4] + '.txt'
+            txt_path = os.path.join(data_dir, txt_fn)
+            if not os.path.exists(txt_path):
+                continue
+            idx = self._trailing_index(fn)
+            pairs.append((idx, txt_path, os.path.join(data_dir, fn)))
+        # 优先按帧号排序，无帧号的排在最后按文件名排序
+        pairs.sort(key=lambda p: (p[0] is None, p[0] if p[0] is not None else 0, p[1]))
+        return pairs
+
+    def _load_data_superlio(self, data_dir):
+        """
+        加载 Super-LIO 原生格式。
+
+        pcd 为世界系(地图系)累积点云，所有帧共享同一原点(程序起点)；
+        txt 每行: timestamp tx ty tz qx qy qz qw (位姿为 body→world)。
+
+        为了让 SC-PGO 流程（BTC/GICP 均假设输入为传感器系局部点云）正常工作，
+        这里将世界系点云转换到对应帧的 body 系:
+            p_body = R^T * (p_world - t)
+        """
+        pairs = self._find_superlio_pairs(data_dir)
+        if not pairs:
+            print(f"[ERROR] 未找到 scans_*.pcd + scans_*.txt 成对文件: {data_dir}")
+            return False
+
+        print(f"[Load] 检测到 Super-LIO 原生格式: {len(pairs)} 帧 (world→body 转换)")
+
+        if self.merge_n > 1 and self._merge_cache_hit():
+            self.all_poses = self._load_poses_kitti(
+                os.path.join(data_dir, "merged_odom_poses.txt"))
+            self.all_scans = []
+            return True
+
+        self.all_poses = []
+        self.all_scans = []
+        bad_pose = 0
+        _t_parse = 0.0        # 位姿 txt 解析
+        _t_read = 0.0         # pcd 读取（含二进制解析）
+        _t_xform = 0.0        # world→body 变换
+        _pts_total = 0
+        _read_max_dt = 0.0    # 最慢单帧 pcd 读取耗时
+        _read_max_pts = 0
+        for idx, txt_path, pcd_path in pairs:
+            _t0 = time.perf_counter()
+            T, ts = self._load_superlio_pose(txt_path)
+            _t_parse += time.perf_counter() - _t0
+            if T is None:
+                print(f"[WARN] 位姿文件无法解析: {txt_path}")
+                bad_pose += 1
+                continue
+
+            _t0 = time.perf_counter()
+            pts_world = self._load_pcd(pcd_path)
+            _dt_read = time.perf_counter() - _t0
+            _t_read += _dt_read
+            if _dt_read > _read_max_dt:
+                _read_max_dt = _dt_read
+                _read_max_pts = len(pts_world)
+            if len(pts_world) == 0:
+                print(f"[WARN] 点云文件为空: {pcd_path}")
+                self.all_poses.append(T)
+                self.all_scans.append(np.empty((0, 3)))
+                continue
+
+            # world → body: p_body = R^T (p_world - t)
+            _t0 = time.perf_counter()
+            R = T[:3, :3]
+            t = T[:3, 3]
+            pts_body = (R.T @ (pts_world - t).T).T
+            _t_xform += time.perf_counter() - _t0
+
+            _pts_total += len(pts_body)
+            self.all_poses.append(T)
+            self.all_scans.append(np.ascontiguousarray(pts_body, dtype=np.float32))
+
+        if bad_pose:
+            print(f"[WARN] 跳过 {bad_pose} 个无效位姿")
+        print(f"[Load] 加载了 {len(self.all_poses)} 个位姿, {len(self.all_scans)} 帧点云")
+        print(f"  [Load-Timing] 位姿解析 {_t_parse:.2f}s | PCD读取 {_t_read:.2f}s | "
+              f"world→body {_t_xform:.2f}s | 总点数 {_pts_total:,} "
+              f"(均 {_pts_total / max(len(self.all_scans), 1):.0f})")
+        print(f"  [Load-Timing] 最慢单帧 PCD读取 {_read_max_dt:.2f}s ({_read_max_pts:,} 点)")
+        return len(self.all_poses) > 0
+
+    @staticmethod
+    def _load_superlio_pose(filepath):
+        """
+        解析 Super-LIO 原生位姿文件，返回 (4x4矩阵, timestamp)。
+        格式: timestamp tx ty tz qx qy qz qw
+        """
+        try:
+            with open(filepath, 'r') as f:
+                line = f.readline().strip()
+            if not line:
+                return None, None
+            vals = [float(v) for v in line.split()]
+            if len(vals) < 8:
+                return None, None
+            ts = vals[0]
+            t = np.array(vals[1:4], dtype=np.float64)
+            R = _quat_xyzw_to_matrix(vals[4], vals[5], vals[6], vals[7])
+            T = np.eye(4)
+            T[:3, :3] = R
+            T[:3, 3] = t
+            return T, ts
+        except Exception as e:
+            print(f"[ERROR] 解析位姿失败: {filepath}, {e}")
+            return None, None
 
     def _merge_cache_hit(self):
         """检查合并缓存是否存在且数量匹配"""
@@ -1160,8 +1654,41 @@ class OfflineLoopCloser:
             print("[ERROR] 请先调用 load_data()")
             return
 
+        # ===== 性能计时 =====
+        GICP_STATS.reset()
+        _t_run0 = time.perf_counter()
+        _t_prev = _t_run0
+        _timings = []
+
+        def _lap(name):
+            nonlocal _t_prev
+            _now = time.perf_counter()
+            _timings.append((name, _now - _t_prev))
+            _t_prev = _now
+            print(f"  [Timing] {name}: {_timings[-1][1]:.2f}s")
+
+        def _timing_report():
+            total = time.perf_counter() - _t_run0
+            print("\n========== 耗时汇总 ==========")
+            for name, dt in _timings:
+                print(f"  {name:<22}: {dt:>8.2f}s  ({dt / total * 100:>5.1f}%)")
+            print(f"  {'总计':<22}: {total:>8.2f}s")
+            GICP_STATS.report()
+
+        # ===== 线程超订保护: 外层线程 × GICP内层线程 不应超过 CPU 核数 =====
+        if self.use_gicp and HAS_GICP_OMP:
+            _cores = os.cpu_count() or 1
+            _gicp_threads = max(1, int(getattr(self.gicp_config, 'num_threads', 1)))
+            _max_outer = max(1, _cores // _gicp_threads)
+            if self.num_threads > _max_outer:
+                print(f"[WARN] 线程超订: 外层 {self.num_threads} × GICP内层 {_gicp_threads} = "
+                      f"{self.num_threads * _gicp_threads} > CPU {_cores} 核，"
+                      f"自动将外层线程降为 {_max_outer}")
+                self.num_threads = _max_outer
+
         # ===== 步骤 0: 多帧合并 (可选) =====
         self._merge_frames()
+        _lap("步骤0 多帧合并")
 
         # ===== 步骤 1: 关键帧选择 (对应 C++ process_pg 中的关键帧判断) =====
         print("\n===== 步骤 1: 关键帧选择 =====")
@@ -1169,6 +1696,7 @@ class OfflineLoopCloser:
               f"deg_gap={self.keyframe_deg_gap:.1f}°")
         self._select_keyframes()
         print(f"  关键帧数: {len(self.keyframe_poses)} / {len(self.all_poses)}")
+        _lap("步骤1 关键帧选择")
 
         if len(self.keyframe_poses) < 20:
             print("[WARN] 关键帧数不足 20，无法进行回环检测")
@@ -1186,28 +1714,36 @@ class OfflineLoopCloser:
         diff = positions[:, None, :] - positions[None, :, :]
         self.keyframe_distance_matrix = np.linalg.norm(diff, axis=2).astype(np.float32)
         print(f"  距离矩阵 {num_kf}x{num_kf} 已预计算完成")
+        _lap("距离矩阵预计算")
 
         # ===== 步骤 2: BTC 描述子生成 + 数据库构建 =====
         print("\n===== 步骤 2: BTC 描述子生成 =====")
         step2_total = len(self.keyframe_clouds)
 
-        # 尝试从缓存加载已有帧
-        loaded_set, reason = self._try_load_btc_cache(step2_total)
-        if reason:
-            print(f"  [Cache] {reason}")
+        if self.btc_manager is None:
+            # odom_only / sc 模式：不需要 BTC 描述子
+            print("  [Skip] 当前模式 ({} ) 不需要生成 BTC 描述子".format(self.use_method))
+            loaded_set = set()
+            to_generate = []
+        else:
+            # 尝试从缓存加载已有帧
+            loaded_set, reason = self._try_load_btc_cache(step2_total)
+            if reason:
+                print(f"  [Cache] {reason}")
 
-        # 确保 params.json 存在
-        cache_dir = self._btc_cache_dir()
-        params_file = os.path.join(cache_dir, "params.json")
-        if not os.path.exists(params_file):
-            self._btc_cache_save_params()
+            # 确保 params.json 存在
+            cache_dir = self._btc_cache_dir()
+            params_file = os.path.join(cache_dir, "params.json")
+            if not os.path.exists(params_file):
+                self._btc_cache_save_params()
 
-        # 确定需要生成的帧
-        to_generate = [i for i in range(step2_total) if i not in loaded_set]
+            # 确定需要生成的帧
+            to_generate = [i for i in range(step2_total) if i not in loaded_set]
         already_done = len(loaded_set)
 
         if not to_generate:
-            print(f"  全部 {step2_total} 帧已缓存，跳过生成")
+            if loaded_set:
+                print(f"  全部 {step2_total} 帧已缓存，跳过生成")
         else:
             print(f"  需要生成: {len(to_generate)} 帧, 已缓存: {already_done} 帧")
             print(f"  线程数: {self.num_threads}")
@@ -1261,15 +1797,54 @@ class OfflineLoopCloser:
 
         db_size = self.btc_manager.GetDatabaseSize() if hasattr(self.btc_manager, 'GetDatabaseSize') else 'N/A'
         print(f"\n  数据库大小: {db_size}, 总帧: {step2_total}")
+        _lap("步骤2 BTC描述子")
 
         # ===== 步骤 3: 回环检测 + GICP 精化 + 验证 =====
         print("\n===== 步骤 3: 回环检测 (多线程加速) =====")
         print(f"  线程数: {self.num_threads}")
+
+        # ----- 性能诊断: odom候选对数量 / 线程超订 -----
+        _thr = self.odom_direct_threshold
+        _skip = self.skip_near_num
+        _zgate = getattr(self, 'loop_z_gate', 0.0)
+        _xf_on = getattr(self, 'cross_floor_enabled', False)
+        _xf_max_dz = getattr(self, 'cross_floor_max_dz', 4.0)
+        _cand = 0
+        _cand_dz = 0       # 被层高门控剔除(且未进入跨楼层通道)的数量
+        _cand_xf = 0       # 进入跨楼层景观约束通道的数量
+        for _i in range(len(self.keyframe_poses)):
+            # 与 _process_frame_step3 一致: frame_diff > skip_near 且距离 < 阈值
+            # distances[j] 对应 j=0..i-1, frame_diff = i-j > skip -> j < i-skip
+            if _i <= _skip:
+                continue
+            _d = self.keyframe_distance_matrix[_i, :_i - _skip]
+            _z_i = self.keyframe_poses[_i][2, 3]
+            for _j in np.nonzero(_d < _thr)[0]:
+                _dz = abs(_z_i - self.keyframe_poses[_j][2, 3])
+                if _zgate > 0 and _dz > _zgate:
+                    if _xf_on and _dz <= _xf_max_dz:
+                        _cand_xf += 1
+                    else:
+                        _cand_dz += 1
+                else:
+                    _cand += 1
+        _gicp_threads = getattr(self.gicp_config, 'num_threads', 1)
+        _cores = os.cpu_count() or 1
+        print(f"  [Diag] odom候选对(将触发GICP): {_cand}  "
+              f"(阈值{_thr}m, skip_near={self.skip_near_num}, "
+              f"层高门控剔除{_cand_dz}对, z_gate={_zgate}m)")
+        if _xf_on:
+            print(f"  [Diag] 跨楼层景观候选对(远点GICP): {_cand_xf} "
+                  f"(dz∈({_zgate}, {_xf_max_dz}]m)")
+        print(f"  [Diag] 线程: 外层{self.num_threads} x GICP内层{_gicp_threads} = "
+              f"{self.num_threads * _gicp_threads} vs CPU核心{_cores}"
+              f"{'  <== 超订!' if self.num_threads * _gicp_threads > _cores else ''}")
         loop_constraints = []  # [(prev_idx, curr_idx, relative_pose_4x4, score), ...]
         step3_no_btc_frames = 0
         step3_search_count = 0
         step3_loop_count = 0
         odom_direct_verify_count = 0
+        cross_floor_count = 0
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.num_threads) as executor:
             # 提交所有帧到线程池，提交时立即发布 odom 进度（线性显示）
@@ -1304,6 +1879,9 @@ class OfflineLoopCloser:
                 if frame_result.get('odom_direct'):
                     odom_direct_verify_count += 1
 
+                if frame_result.get('cross_floor'):
+                    cross_floor_count += 1
+
                 constraint = frame_result.get('constraint')
                 if constraint is not None:
                     loop_constraints.append(constraint)
@@ -1318,9 +1896,10 @@ class OfflineLoopCloser:
         print(f"  Odom直接验证: {odom_direct_verify_count} (odom距离<3m直接GICP)")
         print(f"  BTC检测回环: {step3_loop_count - odom_direct_verify_count}")
         print(f"  检测到回环: {step3_loop_count} (通过验证: {len(loop_constraints)})")
-        print(f"  总计检测到 {len(loop_constraints)} 个回环")
+        print(f"  跨楼层景观约束: {cross_floor_count} (非同一层回环，仅修正层间相对位姿)")
+        print(f"  总计位姿图约束: {len(loop_constraints)}")
         if loop_constraints:
-            print(f"  ---- 通过验证的回环列表 ----")
+            print(f"  ---- 通过验证的约束列表 ----")
             for i, constraint in enumerate(loop_constraints):
                 # 统一格式: (prev_idx, curr_idx, rel_pose, score, loop_type)
                 prev_idx, curr_idx, rel_pose, score, loop_type = constraint
@@ -1328,9 +1907,20 @@ class OfflineLoopCloser:
                 if loop_type == 'odom_direct':
                     print(f"  [{i+1}] 帧 {prev_idx} <-> {curr_idx} | odom_direct | "
                           f"平移: ({t[0]:.2f}, {t[1]:.2f}, {t[2]:.2f})")
+                elif loop_type == 'cross_floor':
+                    print(f"  [{i+1}] 帧 {prev_idx} <-> {curr_idx} | 跨楼层景观 | "
+                          f"fitness: {score:.4f} | 平移: ({t[0]:.2f}, {t[1]:.2f}, {t[2]:.2f})")
                 else:
                     print(f"  [{i+1}] 帧 {prev_idx} <-> {curr_idx} | BTC | "
                           f"Score: {score:.4f} | 平移: ({t[0]:.2f}, {t[1]:.2f}, {t[2]:.2f})")
+        # ===== 回环一致性校验 (PCM): 仅对同层回环生效，跨楼层景观约束不参与 =====
+        if getattr(self, 'enable_pcm', False):
+            _same = [c for c in loop_constraints if c[4] != 'cross_floor']
+            _xf = [c for c in loop_constraints if c[4] == 'cross_floor']
+            if len(_same) > 2:
+                _same = self._filter_loops_pcm(_same)
+            loop_constraints = _same + _xf
+        _lap("步骤3 回环检测")
 
         # ===== 步骤 4: ISAM2 位姿图优化 (对应 C++ ISAM2) =====
         print("\n===== 步骤 4: ISAM2 位姿图优化 =====")
@@ -1338,10 +1928,15 @@ class OfflineLoopCloser:
 
         # 发布优化后的关键帧轨迹（PGO 输出），与 odom_keyframe_path 对照比较 PGO 效果
         self._ros_publish_path(optimized_poses, self._ros_pub_optimized_path)
+        _lap("步骤4 ISAM2优化")
 
         # ===== 步骤 5: 保存结果 =====
         print("\n===== 步骤 5: 保存结果 =====")
-        self._save_results(optimized_poses)
+        try:
+            self._save_results(optimized_poses)
+        finally:
+            _lap("步骤5 保存结果")
+            _timing_report()
 
         return optimized_poses
 
@@ -1435,7 +2030,12 @@ class OfflineLoopCloser:
 
         # ===== Odom距离直接验证（查表优化）=====
         odom_direct_candidates = []
+        cross_floor_candidates = []   # 跨楼层候选: (j, odom_dist, dz), 用窗外景观约束
         skip_near_num = self.skip_near_num
+        z_i = current_position[2]
+        z_gate = getattr(self, 'loop_z_gate', 0.0)
+        _xf_on = getattr(self, 'cross_floor_enabled', False)
+        _xf_max_dz = getattr(self, 'cross_floor_max_dz', 4.0)
         # 直接从距离矩阵查表获取所有历史帧的距离
         distances = self.keyframe_distance_matrix[i, :i]  # 0 到 i-1 的距离
         for j, odom_distance in enumerate(distances):
@@ -1443,6 +2043,13 @@ class OfflineLoopCloser:
             if frame_diff <= skip_near_num:
                 continue
             if odom_distance < self.odom_direct_threshold:
+                # 层高门控: |dz| 超阈值 => 跨楼层(外观相似的楼梯/走廊)，不作为同地点回环
+                _dz = abs(z_i - self.keyframe_poses[j][2, 3])
+                if z_gate > 0 and _dz > z_gate:
+                    # 可能是跨楼层真重叠(窗外共同景观): 记录为跨楼层候选，走独立验证通道
+                    if _xf_on and _dz <= _xf_max_dz:
+                        cross_floor_candidates.append((j, odom_distance, _dz))
+                    continue
                 odom_direct_candidates.append((j, odom_distance))
 
         if odom_direct_candidates and self.use_gicp and HAS_GICP_OMP:
@@ -1453,12 +2060,25 @@ class OfflineLoopCloser:
                 prev_pose = self.keyframe_poses[candidate_id]
                 relative_pose_matrix = np.linalg.inv(prev_pose) @ curr_pose
 
+                _t0 = time.perf_counter()
                 gicp_result = gicp_align(
                     self.keyframe_clouds_ds[i],
                     self.keyframe_clouds_ds[candidate_id],
                     initial_guess=relative_pose_matrix,
-                    config=self.gicp_config
+                    config=self.gicp_config,
+                    compute_overlap=getattr(self, 'save_fused_scans', False)
                 )
+                _dt_gicp = time.perf_counter() - _t0
+                _n_src = len(self.keyframe_clouds_ds[i])
+                _n_tgt = len(self.keyframe_clouds_ds[candidate_id])
+                _it = int(getattr(gicp_result, 'num_iterations', 0)) if gicp_result else 0
+                _ok = bool(gicp_result and gicp_result.has_converged and
+                           gicp_result.fitness_score < self.gicp_config.fitness_score_threshold)
+                GICP_STATS.add(_dt_gicp, 'odom_direct', _n_src, _n_tgt, _it, _ok)
+                _c, _tot = GICP_STATS.snapshot()
+                print(f"  [GICP-Timing] {candidate_id}<->{i}: {_dt_gicp:.2f}s | iter={_it} "
+                      f"{'OK' if _ok else 'FAIL'} | 累计 #{_c} 次 {_tot:.1f}s | "
+                      f"src={_n_src}, tgt={_n_tgt}")
 
                 if gicp_result and gicp_result.has_converged:
                     self._save_fused_cloud(i, candidate_id, gicp_result.transformation,
@@ -1492,6 +2112,52 @@ class OfflineLoopCloser:
                         self.keyframe_poses[candidate_id],
                         self.keyframe_poses[i])
                     return result
+
+        # ===== 跨楼层景观约束验证 =====
+        # 用窗外共同景观(远点)对齐不同楼层的帧，修正层间相对位姿；
+        # 不作为同一层回环，也绝不把两帧拉到同一高度。
+        if cross_floor_candidates and self.use_gicp and HAS_GICP_OMP:
+            _far_d = self.cross_floor_far_dist
+            _min_pts = self.cross_floor_min_pts
+            _far_src = _far_range_points(self.keyframe_clouds_ds[i], _far_d)
+            if len(_far_src) < _min_pts:
+                print(f"  [XFloor] 帧 {i} 远点不足 ({len(_far_src)} < {_min_pts}, >{_far_d}m), "
+                      f"跳过 {len(cross_floor_candidates)} 个跨楼层候选")
+            else:
+                _best = None
+                for (candidate_id, odom_dist, _dz) in cross_floor_candidates:
+                    _far_tgt = _far_range_points(self.keyframe_clouds_ds[candidate_id], _far_d)
+                    if len(_far_tgt) < _min_pts:
+                        continue
+                    print(f"  [XFloor] 帧 {i} <-> {candidate_id} | dz={_dz:.2f}m | "
+                          f"远点 {len(_far_src)}/{len(_far_tgt)} (>={_far_d}m), 仅用远点GICP")
+                    relative_pose_matrix = (np.linalg.inv(self.keyframe_poses[candidate_id])
+                                            @ self.keyframe_poses[i])
+                    _t0 = time.perf_counter()
+                    gicp_result = gicp_align(
+                        _far_src, _far_tgt,
+                        initial_guess=relative_pose_matrix,
+                        config=self.gicp_config
+                    )
+                    _dt_gicp = time.perf_counter() - _t0
+                    _it = int(getattr(gicp_result, 'num_iterations', 0)) if gicp_result else 0
+                    _fit = getattr(gicp_result, 'fitness_score', 1e9) if gicp_result else 1e9
+                    _ok = bool(gicp_result and gicp_result.has_converged and
+                               _fit < self.cross_floor_fitness_thres)
+                    GICP_STATS.add(_dt_gicp, 'cross_floor', len(_far_src), len(_far_tgt), _it, _ok)
+                    print(f"  [GICP-Timing] XFloor {candidate_id}<->{i}: {_dt_gicp:.2f}s | iter={_it} "
+                          f"{'OK' if _ok else 'FAIL'} | fitness={_fit:.4f}")
+                    if _ok and (_best is None or _fit < _best[3]):
+                        _best = (candidate_id, _dz, gicp_result.transformation, _fit)
+
+                if _best is not None:
+                    candidate_id, _dz, T_delta, _fit = _best
+                    print(f"  [XFloor SUCCESS] 跨楼层景观约束建立: {candidate_id} <-> {i} | "
+                          f"dz={_dz:.2f}m | fitness={_fit:.4f} (非同一层回环)")
+                    result['cross_floor'] = True
+                    result['constraint'] = (
+                        candidate_id, i, T_delta, _fit, 'cross_floor'
+                    )
 
         # odom_only 模式：只使用 Odom 直接验证，跳过 BTC/SC 搜索
         if self.use_method == 'odom_only':
@@ -1558,6 +2224,13 @@ class OfflineLoopCloser:
         # GICP 精化
         prev_idx = match_frame_id
         curr_idx = i
+        # 层高门控: 跨楼层(外观相似)不作为同地点回环
+        if self.loop_z_gate > 0:
+            _dz = abs(self.keyframe_poses[curr_idx][2, 3] - self.keyframe_poses[prev_idx][2, 3])
+            if _dz > self.loop_z_gate:
+                print(f"  [BTC Loop] 跨楼层跳过: {prev_idx} <-> {curr_idx} "
+                      f"(dz={_dz:.2f}m > {self.loop_z_gate}m)")
+                return result
         print(f"  [BTC Loop] 检测到回环! {prev_idx} <-> {curr_idx}, score: {loop_score:.4f}")
         gicp_success = False
         gicp_fitness = 0.0
@@ -1585,12 +2258,25 @@ class OfflineLoopCloser:
                       f"{self.gicp_config.max_init_translation}m，跳过")
                 return result
 
+            _t0 = time.perf_counter()
             gicp_result = gicp_align(
                 self.keyframe_clouds_ds[curr_idx],
                 self.keyframe_clouds_ds[prev_idx],
                 initial_guess=initial_guess,
-                config=self.gicp_config
+                config=self.gicp_config,
+                compute_overlap=getattr(self, 'save_fused_scans', False)
             )
+            _dt_gicp = time.perf_counter() - _t0
+            _n_src = len(self.keyframe_clouds_ds[curr_idx])
+            _n_tgt = len(self.keyframe_clouds_ds[prev_idx])
+            _it = int(getattr(gicp_result, 'num_iterations', 0)) if gicp_result else 0
+            _ok = bool(gicp_result and gicp_result.has_converged and
+                       gicp_result.fitness_score < self.gicp_config.fitness_score_threshold)
+            GICP_STATS.add(_dt_gicp, 'btc_loop', _n_src, _n_tgt, _it, _ok)
+            _c, _tot = GICP_STATS.snapshot()
+            print(f"  [GICP-Timing] {prev_idx}<->{curr_idx}: {_dt_gicp:.2f}s | iter={_it} "
+                  f"{'OK' if _ok else 'FAIL'} | 累计 #{_c} 次 {_tot:.1f}s | "
+                  f"src={_n_src}, tgt={_n_tgt}")
 
             if (gicp_result and gicp_result.has_converged and
                     gicp_result.fitness_score < self.gicp_config.fitness_score_threshold):
@@ -1753,13 +2439,20 @@ class OfflineLoopCloser:
         self.keyframe_poses6d = []
         self.keyframe_indices = []
 
+        _t_ds = 0.0
+        _pts_in = 0
+        _pts_out = 0
         for i in kf_indices:
             T = self.all_poses[i]
             pose6d = self._matrix_to_pose6d(T)
             cloud = self.all_scans[i]
 
             if len(cloud) > 0:
+                _t0 = time.perf_counter()
                 cloud_ds = down_sampling_voxel(cloud, self.scan_ds_size)
+                _t_ds += time.perf_counter() - _t0
+                _pts_in += len(cloud)
+                _pts_out += len(cloud_ds)
             else:
                 cloud_ds = cloud
 
@@ -1769,12 +2462,60 @@ class OfflineLoopCloser:
             self.keyframe_poses6d.append(pose6d)
             self.keyframe_indices.append(i)
 
+        print(f"  [KFrame-Timing] 体素下采样 {len(kf_indices)} 帧: {_t_ds:.2f}s | "
+              f"输入点 {_pts_in:,} → 输出点 {_pts_out:,} (voxel={self.scan_ds_size})")
+
+    def _filter_loops_pcm(self, loop_constraints):
+        """
+        回环一致性校验 (Pairwise Consistency Maximization 简化版)。
+
+        以里程计链为参考，检查任意两个回环组成的闭合环残差：
+            T1 @ O(b→c) @ T2 @ O(d→a) ≈ I
+        贪心保留“最大的一致子集”，剔除与群体不一致的孤立/错误回环
+        （典型：多楼层外观相似的楼梯被误当作同一地点）。
+
+        loop_constraints: [(prev_idx, curr_idx, rel_pose_4x4, score, loop_type), ...]
+        返回: 过滤后的 loop_constraints
+        """
+        n = len(loop_constraints)
+        if n <= 2:
+            return loop_constraints
+
+        pos_thres = getattr(self, 'pcm_pos_thres', 1.5)
+        rot_thres = getattr(self, 'pcm_rot_thres', 0.2)
+        P = self.keyframe_poses
+
+        def _consistent(l1, l2):
+            a, b, T1 = l1[0], l1[1], l1[2]
+            c, d, T2 = l2[0], l2[1], l2[2]
+            # gtsam 约定: delta = inv(pose_i) @ pose_j
+            O_bc = np.linalg.inv(P[b]) @ P[c]
+            O_da = np.linalg.inv(P[d]) @ P[a]
+            C = T1 @ O_bc @ T2 @ O_da
+            dt = float(np.linalg.norm(C[:3, 3]))
+            return dt < pos_thres and _rot_angle_rad(C[:3, :3]) < rot_thres
+
+        # 按 score 升序（越小越好）贪心选兼容子集
+        order = sorted(range(n), key=lambda k: loop_constraints[k][3])
+        kept = []
+        for k in order:
+            if all(_consistent(loop_constraints[k], loop_constraints[m]) for m in kept):
+                kept.append(k)
+        kept.sort()
+        dropped = n - len(kept)
+        if dropped:
+            print(f"  [PCM] 一致性校验: 保留 {len(kept)}/{n} 个回环 "
+                  f"(剔除 {dropped} 个不一致回环, pos<{pos_thres}m, rot<{rot_thres}rad)")
+        else:
+            print(f"  [PCM] 一致性校验: 全部 {n} 个回环通过")
+        return [loop_constraints[k] for k in kept]
+
     def _optimize_pose_graph(self, loop_constraints):
         """
         ISAM2 位姿图优化，与 C++ 版本一致:
           - prior noise: 1e-12
           - odom noise: [1e-6, 1e-6, 1e-6, 1e-4, 1e-4, 1e-4]
-          - loop noise: Huber(1.345) + Diagonal(0.5)
+          - loop noise: 鲁棒核(loop_robust_kernel, 默认 Huber) + Diagonal(1.0/0.25)
         """
         if not HAS_GTSAM:
             print("[SKIP] GTSAM 不可用，跳过位姿图优化")
@@ -1783,7 +2524,9 @@ class OfflineLoopCloser:
         if len(self.keyframe_poses) == 0:
             return self.keyframe_poses
 
-        prior_noise, odom_noise, robust_loop_noise, robust_gps_noise = init_noises()
+        prior_noise, odom_noise, robust_loop_noise, robust_gps_noise = init_noises(
+            getattr(self, 'loop_robust_kernel', 'huber'),
+            getattr(self, 'loop_robust_k', 0.0))
 
         # ISAM2 参数 (对应 C++ ISAM2Params)
         isam_params = gtsam.ISAM2Params()
@@ -1815,7 +2558,10 @@ class OfflineLoopCloser:
 
             rel_gtsam = matrix_to_gtsam_pose3(rel_pose_mat)
             graph.add(gtsam.BetweenFactorPose3(prev_idx, curr_idx, rel_gtsam, robust_loop_noise))
-            print(f"  添加回环因子: {prev_idx} <-> {curr_idx}")
+            if loop_type == 'cross_floor':
+                print(f"  添加跨楼层景观约束: {prev_idx} <-> {curr_idx}")
+            else:
+                print(f"  添加回环因子: {prev_idx} <-> {curr_idx}")
 
         # 离线优化使用 Levenberg-Marquardt 批量优化器
         # ISAM2 是增量式优化器，适合在线 SLAM；LM 适合小规模离线批量优化
@@ -1948,7 +2694,10 @@ class OfflineLoopCloser:
          gicp_overlap: float, overlap ratio (0~1)
         """
         fused_dir = os.path.join(self.data_dir, "FusedScans")
-        os.makedirs(fused_dir, exist_ok=True)
+
+        if not getattr(self, 'save_fused_scans', False):
+            print(f"  [Fused] 已跳过 (save_fused_scans=false): {tag} {prev_idx}↔{curr_idx}")
+            return
 
         curr_cloud = self.keyframe_clouds_ds[curr_idx]
         prev_cloud = self.keyframe_clouds_ds[prev_idx]
@@ -1980,8 +2729,15 @@ class OfflineLoopCloser:
         odom_path = os.path.join(fused_dir,
             f"{tag}_fit{gicp_fitness:.2f}m_ovl{gicp_overlap:.0%}_{prev_idx:04d}_to_{curr_idx:04d}_odom.pcd")
 
-        _save_pcd_numpy_intensity(gicp_path, fused_pts_gicp, fused_int_gicp)
-        _save_pcd_numpy_intensity(odom_path, fused_pts_odom, fused_int_odom)
+        # FusedScans 仅用于目视检查，写入失败不应影响回环结果
+        try:
+            os.makedirs(fused_dir, exist_ok=True)
+            _save_pcd_numpy_intensity(gicp_path, fused_pts_gicp, fused_int_gicp)
+            _save_pcd_numpy_intensity(odom_path, fused_pts_odom, fused_int_odom)
+        except Exception as e:
+            print(f"  [WARN] FusedScans 写入失败 ({tag} {prev_idx}↔{curr_idx})，"
+                  f"已跳过可视化输出，不影响回环结果: {e}")
+            return
 
         print(f"  [Fused] 已保存: {tag} {prev_idx}↔{curr_idx}")
         print(f"          GICP位移={np.linalg.norm(t_gicp):.3f}m, Odom位移={np.linalg.norm(t_odom):.3f}m, "
