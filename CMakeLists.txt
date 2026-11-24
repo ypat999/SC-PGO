@@ -128,7 +128,13 @@ if(BUILD_PYTHON_BINDING)
   message(STATUS "Python bindings (btc_cpp, sc_cpp) will be installed to: lib/python3/dist-packages")
 
   # GICP_OMP Python binding - 只依赖PCL核心组件 + OpenMP
-  set(_ndt_omp_src_dir ${CMAKE_CURRENT_SOURCE_DIR}/../../src/ndt_omp_ros2/src/pclomp)
+  # ndt_omp_ros2 位置：优先与本包同级（rkdrone_third_party_pkgs/lio/ 布局），回退到旧布局 ../../src/
+  if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../ndt_omp_ros2/src/pclomp)
+    set(_ndt_omp_root ${CMAKE_CURRENT_SOURCE_DIR}/../ndt_omp_ros2)
+  else()
+    set(_ndt_omp_root ${CMAKE_CURRENT_SOURCE_DIR}/../../src/ndt_omp_ros2)
+  endif()
+  set(_ndt_omp_src_dir ${_ndt_omp_root}/src/pclomp)
   pybind11_add_module(gicp_omp_cpp
     src/gicp_python_binding.cpp
     ${_ndt_omp_src_dir}/gicp_omp.cpp
@@ -139,7 +145,7 @@ if(BUILD_PYTHON_BINDING)
   )
   target_include_directories(gicp_omp_cpp PRIVATE
     ${PCL_INCLUDE_DIRS}
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../src/ndt_omp_ros2/include
+    ${_ndt_omp_root}/include
   )
   target_compile_options(gicp_omp_cpp PRIVATE ${OpenMP_CXX_FLAGS})
 
